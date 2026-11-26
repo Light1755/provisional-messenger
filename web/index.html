@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <!--
+    If you are serving your web app in a path other than the root, change the
+    href value below to reflect the base path you are serving from.
+
+    The path provided below has to start and end with a slash "/" in order for
+    it to work correctly.
+
+    For more details:
+    * https://developer.mozilla.org/en-US/docs/Web/HTML/Element/base
+
+    This is a placeholder for base href that will be replaced by the value of
+    the `--base-href` argument provided to `flutter build`.
+  -->
+  <base href="$FLUTTER_BASE_HREF">
+
+  <meta charset="UTF-8">
+  <meta content="IE=Edge" http-equiv="X-UA-Compatible">
+  <meta name="description" content="Provisional Messenger — anonymous, expiring conversations you can burn at any time.">
+  <meta name="theme-color" content="#101513" media="(prefers-color-scheme: dark)">
+  <meta name="theme-color" content="#F5F6F3" media="(prefers-color-scheme: light)">
+  <meta name="color-scheme" content="dark light">
+
+  <!--
+    Uncomment the tag below to lay the app out underneath the parts of the
+    screen that the device obstructs, such as a display cutout, the rounded
+    corners of the screen, or a home indicator.
+
+    Without it, the browser keeps the app clear of them, and `SafeArea` and
+    `MediaQuery.paddingOf` report no padding. With it, the app covers the whole
+    screen, and it is up to the app to keep its own content out of the way,
+    which is what `SafeArea` is for.
+  -->
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+
+  <!-- iOS meta tags & icons -->
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Provisional Messenger">
+  <link rel="apple-touch-icon" href="icons/Icon-192.png">
+
+  <!-- Favicon -->
+  <link rel="icon" type="image/png" href="favicon.png"/>
+
+  <title>Provisional Messenger</title>
+  <link rel="manifest" href="manifest.json">
+  <style>
+    html,
+    body {
+      margin: 0;
+      height: 100%;
+      background: #101513;
+    }
+
+    #boot-splash {
+      position: fixed;
+      inset: 0;
+      z-index: 10;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      background: #101513;
+      color: #f5f6f3;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+        Helvetica, Arial, sans-serif;
+      transition: opacity 240ms ease;
+      -webkit-user-select: none;
+      user-select: none;
+    }
+
+    .boot-mark {
+      display: block;
+      width: 68px;
+      height: 68px;
+      border-radius: 19px;
+    }
+
+    .boot-name {
+      font-size: 21px;
+      font-weight: 800;
+      letter-spacing: -0.6px;
+    }
+
+    .boot-sub {
+      color: rgba(245, 246, 243, 0.5);
+      font-size: 12px;
+    }
+
+    .boot-dot {
+      width: 15px;
+      height: 15px;
+      margin-top: 8px;
+      border: 2px solid rgba(245, 246, 243, 0.2);
+      border-top-color: #3d8b7d;
+      border-radius: 50%;
+      animation: boot-spin 800ms linear infinite;
+    }
+
+    @keyframes boot-spin {
+      to {
+        transform: rotate(360deg);
+      }
+    }
+
+    @media (prefers-color-scheme: light) {
+      html,
+      body {
+        background: #f5f6f3;
+      }
+
+      #boot-splash {
+        background: #f5f6f3;
+        color: #101513;
+      }
+
+      .boot-sub {
+        color: rgba(16, 21, 19, 0.45);
+      }
+
+      .boot-dot {
+        border-color: rgba(16, 21, 19, 0.18);
+        border-top-color: #3d8b7d;
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .boot-dot {
+        animation: none;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div id="boot-splash" role="status" aria-label="Loading Provisional Messenger">
+    <img class="boot-mark" src="icons/Icon-192.png" alt="">
+    <div class="boot-name">Provisional</div>
+    <div class="boot-sub">Private, expiring conversations</div>
+    <div class="boot-dot"></div>
+  </div>
+  <script>
+    window.addEventListener('flutter-first-frame', function () {
+      var splash = document.getElementById('boot-splash');
+      if (!splash) return;
+      splash.style.opacity = '0';
+      splash.style.pointerEvents = 'none';
+      window.setTimeout(function () {
+        splash.remove();
+      }, 260);
+    });
+  </script>
+  <!--
+    You can customize the "flutter_bootstrap.js" script.
+    This is useful to provide a custom configuration to the Flutter loader
+    or to give the user feedback during the initialization process.
+
+    For more details:
+    * https://docs.flutter.dev/platform-integration/web/initialization
+  -->
+  <script src="flutter_bootstrap.js" async></script>
+</body>
+</html>

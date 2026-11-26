@@ -1,0 +1,56 @@
+name: provisional_messenger
+description: "Provisional — anonymous, burnable messenger with expiring conversations"
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.5.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  file_picker: ^13.4.1
+  path_provider: ^2.1.6
+  cupertino_icons: ^1.0.8
+  supabase_flutter: ^2.18.3
+  record: ^7.2.0
+  just_audio: ^0.10.6
+  shared_preferences: ^2.5.6
+  uuid: ^4.6.0
+  intl: ^0.20.2
+  mime: ^2.1.0
+  provider: ^6.1.5+1
+  web: ^1.1.2
+  http: ^1.6.0
+  image_picker: ^1.2.4
+  file_saver: ^0.7.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+  flutter_launcher_icons: ^0.14.4
+
+flutter:
+  uses-material-design: true
+
+flutter_launcher_icons:
+  android: true
+  ios: true
+  image_path: "assets/branding/icon.png"
+  min_sdk_android: 21
+  remove_alpha_ios: true
+  adaptive_icon_background: "#F5F6F3"
+  adaptive_icon_foreground: "assets/branding/icon_foreground.png"
+  web:
+    generate: true
+    image_path: "assets/branding/icon.png"
+    background_color: "#F5F6F3"
+    theme_color: "#3D8B7D"
+  windows:
+    generate: true
+    image_path: "assets/branding/icon.png"
+    icon_size: 256
+  macos:
+    generate: true
+    image_path: "assets/branding/icon.png"
