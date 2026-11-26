@@ -81,16 +81,28 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     try {
       if (client.auth.currentSession == null) {
         await client.auth.signInAnonymously();
+      } else {
+        // A saved session can point at an auth user that no longer exists.
+        // Check it before trying to read or create a profile.
+        try {
+          await client.auth.getUser();
+        } catch (_) {
+          await _renewSession();
+        }
       }
 
       Profile? profile;
       try {
         profile = await api.getMyProfile();
       } on ApiException catch (e) {
-        if (!_looksLikeSessionError(e)) rethrow;
+        if (e.code != 'orphan_session' && !_looksLikeSessionError(e)) rethrow;
         _sessionUnusable = true;
         try {
-          await client.auth.refreshSession();
+          if (e.code == 'orphan_session') {
+            await _renewSession();
+          } else {
+            await client.auth.refreshSession();
+          }
         } catch (_) {
           // The next call reports the real error.
         }
@@ -99,7 +111,8 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
           _sessionUnusable = false;
         } catch (retryError) {
           if (retryError is! ApiException ||
-              !_looksLikeSessionError(retryError)) {
+              (retryError.code != 'orphan_session' &&
+                  !_looksLikeSessionError(retryError))) {
             _sessionUnusable = false;
           }
           rethrow;
@@ -128,14 +141,22 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     try {
       profile = await api.createProfile(username);
     } on ApiException catch (e) {
-      // The insert can commit even when its response is lost. If the retry is
-      // told the profile already exists, adopt it instead of leaving onboarding
-      // stuck on an error until an app restart.
       final raw = e.raw?.toLowerCase() ?? '';
-      if (!raw.contains('profile_exists')) rethrow;
-      final existing = await api.getMyProfile();
-      if (existing == null) rethrow;
-      profile = existing;
+      if (e.code == 'orphan_session' || raw.contains('profiles_id_fkey')) {
+        // The saved session outlived its anonymous auth user. Drop it and try
+        // once with a fresh user so the user does not have to restart.
+        if (!await _renewSession()) rethrow;
+        profile = await api.createProfile(username);
+      } else if (raw.contains('profile_exists')) {
+        // The insert can commit even when its response is lost. If the retry is
+        // told the profile already exists, adopt it instead of leaving onboarding
+        // stuck on an error until an app restart.
+        final existing = await api.getMyProfile();
+        if (existing == null) rethrow;
+        profile = existing;
+      } else {
+        rethrow;
+      }
     }
     _me = profile;
     _status = AppStatus.ready;
@@ -297,6 +318,26 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     }
 
     await initialize();
+  }
+
+  /// Drops the local session and creates a new anonymous user.
+  ///
+  /// Used when the server reports that the saved session no longer has an
+  /// auth user. The local sign-out clears storage even when the network call
+  /// fails, which is why its error is ignored.
+  Future<bool> _renewSession() async {
+    if (_disposed) return false;
+    try {
+      await client.auth.signOut();
+    } catch (_) {
+      // The local session is removed before the network call.
+    }
+    try {
+      await client.auth.signInAnonymously();
+      return client.auth.currentSession != null;
+    } catch (_) {
+      return false;
+    }
   }
 
   Future<void> setThemeMode(ThemeMode mode) async {

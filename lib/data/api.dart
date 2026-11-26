@@ -331,6 +331,17 @@ class Api {
   static ApiException _mapPostgrest(PostgrestException e) {
     final raw = e.message;
     final lower = raw.toLowerCase();
+    // A local session can outlive its anonymous auth user (for example after
+    // server-side cleanup). The insert then fails on profiles -> auth.users.
+    // Treat it as a recoverable session problem, not a username problem.
+    if (lower.contains('profiles_id_fkey') ||
+        (e.code == '23503' && lower.contains('profiles'))) {
+      return ApiException(
+        'This session is no longer valid. Reconnecting…',
+        code: 'orphan_session',
+        raw: raw,
+      );
+    }
     if (lower.contains('username_taken')) {
       return ApiException(
         'That username is already taken. Try another one.',
