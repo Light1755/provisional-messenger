@@ -227,7 +227,8 @@ class _ProvisionalAppState extends State<ProvisionalApp> {
 
   @override
   Widget build(BuildContext context) {
-    return ValueListenableBuilder<ThemeMode>(
+    final app = _app;
+    final child = ValueListenableBuilder<ThemeMode>(
       valueListenable: _themeMode,
       builder: (context, themeMode, _) {
         return MaterialApp(
@@ -240,16 +241,18 @@ class _ProvisionalAppState extends State<ProvisionalApp> {
         );
       },
     );
+    // Pushed routes live above MaterialApp's Navigator, outside the home route's
+    // subtree. The provider must be above MaterialApp so screens such as the
+    // conversation can read AppState.
+    if (app == null) return child;
+    return ChangeNotifierProvider<AppState>.value(value: app, child: child);
   }
 
   Widget _home() {
     if (_app != null) {
-      return ChangeNotifierProvider<AppState>.value(
-        value: _app!,
-        child: AuthGate(
-          onResetServer: widget.bakedConfig ? null : _resetServer,
-          bakedConfig: widget.bakedConfig,
-        ),
+      return AuthGate(
+        onResetServer: widget.bakedConfig ? null : _resetServer,
+        bakedConfig: widget.bakedConfig,
       );
     }
     if (_connecting) {

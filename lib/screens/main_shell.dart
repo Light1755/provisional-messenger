@@ -46,6 +46,10 @@ class _MainShellState extends State<MainShell> {
           ],
         ),
         bottomNavigationBar: Container(
+          // Center expands to the maximum height it receives. Without an
+          // explicit height, this bar fills the viewport and leaves the
+          // Scaffold body with zero height on web.
+          height: 64 + MediaQuery.paddingOf(context).bottom,
           decoration: BoxDecoration(
             color: scheme.surface,
             border: Border(

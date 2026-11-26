@@ -9,13 +9,13 @@ plugins {
 }
 
 // Pinned SDK levels and release identity. The version matches pubspec.yaml
-// (1.0.2+3); the Flutter tool writes the same values into local.properties as
+// (1.0.3+4); the Flutter tool writes the same values into local.properties as
 // flutter.versionCode / flutter.versionName during a normal `flutter build`.
 val appCompileSdk = 36
 val appMinSdk = 24
 val appTargetSdk = 36
-val appVersionCode = 3
-val appVersionName = "1.0.2"
+val appVersionCode = 4
+val appVersionName = "1.0.3"
 
 val keystoreProperties = Properties()
 val keystorePropertiesFile = rootProject.file("key.properties")
