@@ -2,6 +2,9 @@
 
 Provisional is a two-person messenger built around deletion. You create a username, start a chat, choose a timer, and either person can burn the chat at any time. There is no email, phone number, password, demo account, or seeded conversation.
 
+- Web app: https://light1755.github.io/provisional-messenger/
+- Android release: https://github.com/Light1755/provisional-messenger/releases/tag/v1.0.0
+
 The client is Flutter. The server is Supabase: Postgres, anonymous auth, Realtime, and a scheduled cleanup job. `supabase/setup.sql` installs the whole server side in one run.
 
 ## Features
