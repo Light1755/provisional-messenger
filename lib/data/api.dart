@@ -1,7 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:typed_data';
 
+import 'package:flutter/foundation.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../core/env.dart';
@@ -140,6 +140,7 @@ class Api {
   Future<List<ChatMessage>> getMessages(
     String conversationId, {
     DateTime? before,
+    String? beforeId,
     int limit = 100,
   }) =>
       _guard(() async {
@@ -148,6 +149,7 @@ class Api {
           params: {
             'p_conversation_id': conversationId,
             'p_before': before?.toUtc().toIso8601String(),
+            'p_before_id': beforeId,
             'p_limit': limit,
           },
         ).timeout(_readTimeout);
@@ -225,10 +227,14 @@ class Api {
           throw ApiException('That attachment is no longer available.');
         }
         final row = rows.first;
+        final raw = row['data_base64'];
+        if (raw is! String) {
+          throw ApiException('That attachment is no longer available.');
+        }
         return AttachmentPayload(
           name: row['file_name'] as String? ?? 'attachment',
           mimeType: row['mime_type'] as String? ?? 'application/octet-stream',
-          bytes: base64Decode(row['data_base64'] as String),
+          bytes: base64Decode(raw),
         );
       });
 
@@ -242,6 +248,13 @@ class Api {
         throw ApiException(
           'Supabase answered, but the Provisional Messenger tables were not '
           'found. Run supabase/setup.sql in the SQL Editor.',
+        );
+      }
+      if (map['cron_ok'] != true) {
+        throw ApiException(
+          'Supabase is reachable, but the minute expiry cleanup is not active. '
+          'Enable pg_cron under Database → Extensions, then run '
+          'supabase/setup.sql again.',
         );
       }
     } on PostgrestException catch (e) {
@@ -328,6 +341,12 @@ class Api {
     );
   }
 
+  @visibleForTesting
+  static ApiException mapPostgrest(PostgrestException e) => _mapPostgrest(e);
+
+  @visibleForTesting
+  static ApiException mapAuth(AuthException e) => _mapAuth(e);
+
   static ApiException _mapPostgrest(PostgrestException e) {
     final raw = e.message;
     final lower = raw.toLowerCase();
@@ -368,6 +387,20 @@ class Api {
         'This device already has a profile.',
         raw: raw,
         code: e.code,
+      );
+    }
+    if (lower.contains('profile_not_found')) {
+      return ApiException(
+        'There is no profile for this session. Create a username to continue.',
+        raw: raw,
+        code: 'profile_not_found',
+      );
+    }
+    if (lower.contains('orphan_session')) {
+      return ApiException(
+        'This session is no longer valid. Reconnecting…',
+        raw: raw,
+        code: 'orphan_session',
       );
     }
     if (lower.contains('not_authenticated')) {
@@ -463,6 +496,12 @@ class Api {
       raw: e.message,
     );
   }
+
+  @visibleForTesting
+  static Map<String, dynamic>? firstMap(dynamic value) => _firstMap(value);
+
+  @visibleForTesting
+  static List<Map<String, dynamic>> rows(dynamic value) => _rows(value);
 
   static Map<String, dynamic>? _firstMap(dynamic value) {
     if (value == null) return null;

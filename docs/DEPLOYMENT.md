@@ -25,11 +25,11 @@ where jobname = 'provisional-purge-expired';
 select public.health_check();
 ```
 
-The job should be active on `* * * * *`. The health check should return `"ok": true`.
+The job should be active on `* * * * *`. The health check should return `"ok": true` and `"cron_ok": true`.
 
 6. Open Project Settings, API. Copy the Project URL and the anon public key.
 
-If you change the schema later, edit the migration in `supabase/migrations/` and copy it over `supabase/setup.sql`. The two files must stay identical.
+If you change the schema later, edit `supabase/setup.sql` and copy it over `supabase/migrations/20261124000000_init.sql`; those two files must stay byte-identical. For an already installed project, add an idempotent migration that re-runs the installer, like `supabase/migrations/20261126000000_fixes.sql`, and apply it in the SQL Editor.
 
 ## 2. Web on GitHub Pages
 
@@ -102,27 +102,35 @@ val keystoreFile = rootProject.file("key.properties")
 if (keystoreFile.exists()) {
     keystoreProperties.load(FileInputStream(keystoreFile))
 }
+val signingValues = listOf(
+    "keyAlias", "keyPassword", "storeFile", "storePassword",
+).associateWith { keystoreProperties.getProperty(it)?.trim().orEmpty() }
+val signingReady = signingValues.values.all { it.isNotEmpty() }
 
 android {
     // ...
     signingConfigs {
-        create("release") {
-            keyAlias = keystoreProperties["keyAlias"] as String
-            keyPassword = keystoreProperties["keyPassword"] as String
-            storeFile = file(keystoreProperties["storeFile"] as String)
-            storePassword = keystoreProperties["storePassword"] as String
+        if (signingReady) {
+            create("release") {
+                keyAlias = signingValues["keyAlias"]
+                keyPassword = signingValues["keyPassword"]
+                storeFile = file(signingValues["storeFile"]!!)
+                storePassword = signingValues["storePassword"]
+            }
         }
     }
 
     buildTypes {
         release {
-            signingConfig = signingConfigs.getByName("release")
+            if (signingReady) {
+                signingConfig = signingConfigs.getByName("release")
+            }
         }
     }
 }
 ```
 
-`android/key.properties`, `*.jks`, and `*.keystore` are already in `.gitignore`.
+`android/key.properties`, `*.jks`, and `*.keystore` are already in `.gitignore`. Keep the keystore outside temporary directories that may be cleaned automatically. If the four signing values are missing, release builds remain unsigned instead of crashing during Gradle configuration; CI uses that path for a compile check. Local release uploads must use the configured keystore.
 
 The `applicationId` and `namespace` are already set to `com.light1755.provisionalmessenger`. Do not change them after release: a different id installs as a separate app.
 
@@ -136,7 +144,7 @@ flutter build appbundle --release \
 
 ### Publish the APK
 
-1. Open the repository's Releases page and create a tag such as `v1.0.0`.
+1. Open the repository's Releases page and create a tag such as `v1.0.1`.
 2. Attach `app-release.apk`.
 3. Include the signing certificate fingerprint and the supported Android version in the release notes.
 4. Tell users that installing an APK from outside a store requires allowing installs from that source, and that updates must use the same signing key.
@@ -147,7 +155,7 @@ Free projects pause after roughly a week without activity. The workflow is [`.gi
 
 1. Add the same `SUPABASE_URL` and `SUPABASE_ANON_KEY` variables or secrets used by the web deploy.
 2. Open Actions, select Supabase keep-alive, and run it once. The log should show `{"ok": true, ...}`.
-3. Leave the schedule in place. It runs every three days and can also be started manually.
+3. Leave the schedule in place. It runs every three days and can also be started manually. The response now includes `cron_ok` and `schema_version` alongside `ok`.
 
 The job calls `POST /rest/v1/rpc/health_check` with the anon key. The function is executable by `anon`, reads no user data, and returns whether the expected tables exist.
 
@@ -157,7 +165,10 @@ GitHub can delay scheduled jobs, and it disables schedules after 60 days without
 
 - `flutter analyze` reports no issues.
 - `flutter test` passes.
+- The web and APK CI build jobs pass.
+- `pubspec.yaml` version and `Env.appVersion` were bumped for the new release.
 - Two devices or two browser profiles can create profiles, chat, send every message type, read receipts, change the timer, burn a chat, and burn a profile.
+- After a profile is created, the device has no logout or start-over control; only a successful profile burn returns it to username creation.
 - Expiry is tested by moving `expires_at` forward, not only by waiting.
 - The production build uses the anon or publishable key, never a server key.
 - The web workflow completed and the site loads from the expected base path.

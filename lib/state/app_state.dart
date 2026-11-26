@@ -55,8 +55,10 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   /// anonymous session itself cannot be refreshed.
   bool get sessionUnusable => _sessionUnusable;
 
-  int get unreadTotal =>
-      _conversations.fold<int>(0, (sum, c) => sum + c.unreadCount);
+  int get unreadTotal => _conversations.fold<int>(
+        0,
+        (sum, c) => sum + (c.isExpired ? 0 : c.unreadCount),
+      );
 
   ConversationSummary? conversationById(String id) {
     for (final conversation in _conversations) {
@@ -83,13 +85,15 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
         await client.auth.signInAnonymously();
       } else {
         // A saved session can point at an auth user that no longer exists.
-        // Check it before trying to read or create a profile.
+        // Only a definite session failure causes renewal. A timeout or other
+        // network error must not throw away access to an existing profile.
         try {
           await client.auth.getUser();
-        } catch (_) {
-          await _renewSession();
+        } catch (e) {
+          if (_isSessionAuthFailure(e)) await _renewSession();
         }
       }
+      if (_disposed) return;
 
       Profile? profile;
       try {
@@ -106,6 +110,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
         } catch (_) {
           // The next call reports the real error.
         }
+        if (_disposed) return;
         try {
           profile = await api.getMyProfile();
           _sessionUnusable = false;
@@ -119,6 +124,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
         }
       }
 
+      if (_disposed) return;
       _me = profile;
       if (profile == null) {
         _teardownLive();
@@ -146,18 +152,21 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
         // The saved session outlived its anonymous auth user. Drop it and try
         // once with a fresh user so the user does not have to restart.
         if (!await _renewSession()) rethrow;
+        if (_disposed) throw StateError('AppState disposed');
         profile = await api.createProfile(username);
       } else if (raw.contains('profile_exists')) {
         // The insert can commit even when its response is lost. If the retry is
         // told the profile already exists, adopt it instead of leaving onboarding
         // stuck on an error until an app restart.
         final existing = await api.getMyProfile();
+        if (_disposed) throw StateError('AppState disposed');
         if (existing == null) rethrow;
         profile = existing;
       } else {
         rethrow;
       }
     }
+    if (_disposed) throw StateError('AppState disposed');
     _me = profile;
     _status = AppStatus.ready;
     _errorMessage = null;
@@ -193,21 +202,49 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
 
     try {
       final list = await api.listConversations();
+      _applyConversationList(list, request);
+    } on ApiException catch (e) {
       if (_disposed || request != _conversationRequest) return;
-      _conversations = list.where((c) => !c.isExpired).toList()
-        ..sort((a, b) => b.sortTime.compareTo(a.sortTime));
-      _conversationsError = null;
+      if (!_looksLikeSessionError(e)) {
+        _conversationsError = e.message;
+      } else {
+        // A session can expire while the app is open. Try one clean renewal;
+        // if that fails, show the recovery action instead of "Offline" forever.
+        final renewed = await _renewSession();
+        if (_disposed || request != _conversationRequest) return;
+        if (renewed) {
+          try {
+            _applyConversationList(await api.listConversations(), request);
+            return;
+          } on ApiException catch (retryError) {
+            if (_disposed || request != _conversationRequest) return;
+            _conversationsError = retryError.message;
+          }
+        }
+        _sessionUnusable = true;
+        _status = AppStatus.error;
+        _errorMessage = 'This session can no longer be used. Start a new '
+            'session to continue. Your old profile cannot be recovered.';
+      }
     } catch (e) {
       if (_disposed || request != _conversationRequest) return;
-      _conversationsError = e is ApiException
-          ? e.message
-          : 'Could not refresh your conversations.';
+      _conversationsError = 'Could not refresh your conversations.';
     } finally {
       if (!_disposed && request == _conversationRequest) {
         _loadingConversations = false;
         _safeNotify();
       }
     }
+  }
+
+  void _applyConversationList(
+    List<ConversationSummary> list,
+    int request,
+  ) {
+    if (_disposed || request != _conversationRequest) return;
+    _conversations = list.where((c) => !c.isExpired).toList()
+      ..sort((a, b) => b.sortTime.compareTo(a.sortTime));
+    _conversationsError = null;
   }
 
   Future<DateTime> changeExpiry(
@@ -244,17 +281,21 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     _safeNotify();
   }
 
-  Future<void> markRead(String conversationId) async {
+  /// Marks a conversation read on the server before clearing the local badge.
+  /// Returns false when the receipt failed so the chat can retry it later.
+  Future<bool> markRead(String conversationId) async {
+    try {
+      await api.markConversationRead(conversationId);
+    } catch (_) {
+      return false;
+    }
+    if (_disposed) return false;
     final index = _conversations.indexWhere((c) => c.id == conversationId);
     if (index >= 0 && _conversations[index].unreadCount != 0) {
       _conversations[index] = _conversations[index].copyWith(unreadCount: 0);
       _safeNotify();
     }
-    try {
-      await api.markConversationRead(conversationId);
-    } catch (_) {
-      // Read receipts are best effort; the next refresh reconciles them.
-    }
+    return true;
   }
 
   Future<void> burnProfile() async {
@@ -287,39 +328,6 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     _safeNotify();
   }
 
-  /// Abandons an unusable session and creates a fresh anonymous one.
-  ///
-  /// The old profile cannot be recovered. This exists because an anonymous
-  /// account has no password and a revoked refresh token would otherwise leave
-  /// the app stuck on the error screen forever.
-  Future<void> startOver() async {
-    if (_disposed) return;
-    _teardownLive();
-    _me = null;
-    _conversations = const [];
-    _conversationsError = null;
-    _errorMessage = null;
-    _status = AppStatus.starting;
-    _safeNotify();
-
-    try {
-      await client.auth.signOut();
-    } catch (_) {
-      // Clearing the local session is enough even if the server call fails.
-    }
-
-    try {
-      await client.auth.signInAnonymously();
-    } catch (e) {
-      _status = AppStatus.error;
-      _errorMessage = _messageFor(e);
-      _safeNotify();
-      return;
-    }
-
-    await initialize();
-  }
-
   /// Drops the local session and creates a new anonymous user.
   ///
   /// Used when the server reports that the saved session no longer has an
@@ -346,9 +354,10 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   }
 
   void _startLive() {
+    if (_disposed || _me == null) return;
     _initInbox();
     _pollTimer ??= Timer.periodic(const Duration(seconds: 20), (_) {
-      refreshConversations(silent: true);
+      if (!_disposed) refreshConversations(silent: true);
     });
     unawaited(refreshConversations());
   }
@@ -365,7 +374,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
 
   void _initInbox() {
     final me = _me;
-    if (me == null) return;
+    if (_disposed || me == null) return;
     final previous = _inboxChannel;
     _inboxChannel = null;
     if (previous != null) unawaited(previous.unsubscribe());
@@ -389,6 +398,17 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       table: 'conversations',
       callback: (_) => _scheduleRefresh(),
     );
+    // The DELETE row fails RLS once its members are cascaded away, so a
+    // short-lived tombstone carries the member ids for a reliable refresh.
+    channel.onPostgresChanges(
+      event: PostgresChangeEvent.insert,
+      schema: 'public',
+      table: 'conversation_deletions',
+      callback: (payload) {
+        final ids = payload.newRecord['member_ids'];
+        if (ids is List && ids.contains(me.id)) _scheduleRefresh();
+      },
+    );
     channel.onPostgresChanges(
       event: PostgresChangeEvent.update,
       schema: 'public',
@@ -400,9 +420,10 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   }
 
   void _scheduleRefresh([Duration delay = const Duration(milliseconds: 450)]) {
+    if (_disposed) return;
     _refreshDebounce?.cancel();
     _refreshDebounce = Timer(delay, () {
-      refreshConversations(silent: true);
+      if (!_disposed) refreshConversations(silent: true);
     });
   }
 
@@ -413,12 +434,31 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     }
   }
 
+  /// True for definite auth failures. Network exceptions have no status and
+  /// must leave a valid local session alone.
+  bool _isSessionAuthFailure(Object e) {
+    if (e is AuthRetryableFetchException) return false;
+    if (e is! AuthException) return false;
+    final status = e.statusCode;
+    if (status == '401' || status == '403' || status == '404') return true;
+    final lower = e.message.toLowerCase();
+    return lower.contains('user not found') ||
+        lower.contains('user_not_found') ||
+        lower.contains('session not found') ||
+        lower.contains('auth session missing');
+  }
+
   bool _looksLikeSessionError(ApiException e) {
-    final message = e.message.toLowerCase();
-    return e.code == '401' ||
+    final lower = e.message.toLowerCase();
+    final raw = e.raw?.toLowerCase() ?? '';
+    return e.code == 'orphan_session' ||
+        e.code == '401' ||
+        e.code == '403' ||
         e.code == 'PGRST301' ||
-        message.contains('jwt') ||
-        message.contains('session');
+        lower.contains('session') ||
+        lower.contains('jwt') ||
+        raw.contains('user_not_found') ||
+        raw.contains('user not found');
   }
 
   String _messageFor(Object error) {

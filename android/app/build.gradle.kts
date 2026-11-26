@@ -13,6 +13,19 @@ val keystorePropertiesFile = rootProject.file("key.properties")
 if (keystorePropertiesFile.exists()) {
     keystoreProperties.load(FileInputStream(keystorePropertiesFile))
 }
+val releaseSigningValues = listOf(
+    "keyAlias",
+    "keyPassword",
+    "storeFile",
+    "storePassword",
+).associateWith { key -> keystoreProperties.getProperty(key)?.trim().orEmpty() }
+val releaseSigningConfigured = releaseSigningValues.values.all { it.isNotEmpty() }
+if (!releaseSigningConfigured) {
+    logger.lifecycle(
+        "Release signing is not configured; add android/key.properties with "
+            + "keyAlias, keyPassword, storeFile, and storePassword.",
+    )
+}
 
 android {
     namespace = "com.light1755.provisionalmessenger"
@@ -37,17 +50,21 @@ android {
     }
 
     signingConfigs {
-        create("release") {
-            keyAlias = keystoreProperties["keyAlias"] as String
-            keyPassword = keystoreProperties["keyPassword"] as String
-            storeFile = keystoreProperties["storeFile"]?.let { file(it as String) }
-            storePassword = keystoreProperties["storePassword"] as String
+        if (releaseSigningConfigured) {
+            create("release") {
+                keyAlias = releaseSigningValues["keyAlias"]
+                keyPassword = releaseSigningValues["keyPassword"]
+                storeFile = file(releaseSigningValues["storeFile"]!!)
+                storePassword = releaseSigningValues["storePassword"]
+            }
         }
     }
 
     buildTypes {
         release {
-            signingConfig = signingConfigs.getByName("release")
+            if (releaseSigningConfigured) {
+                signingConfig = signingConfigs.getByName("release")
+            }
         }
     }
 }

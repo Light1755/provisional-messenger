@@ -88,6 +88,8 @@ class _ConversationScreenState extends State<ConversationScreen>
   bool _polling = false;
   int _messageRequest = 0;
   DateTime? _lastReadThrough;
+  bool _pendingRead = false;
+  bool _readInFlight = false;
 
   StreamSubscription<PlayerState>? _playerStateSub;
   StreamSubscription<Duration>? _positionSub;
@@ -223,6 +225,24 @@ class _ConversationScreenState extends State<ConversationScreen>
             if (deletedId == null) {
               unawaited(_poll());
             } else if (deletedId == _conversationId) {
+              _handleConversationGone();
+            }
+          },
+        )
+        .onPostgresChanges(
+          event: PostgresChangeEvent.insert,
+          schema: 'public',
+          table: 'conversation_deletions',
+          filter: PostgresChangeFilter(
+            type: PostgresChangeFilterType.eq,
+            column: 'conversation_id',
+            value: _conversationId,
+          ),
+          callback: (payload) {
+            // Tombstones survive the member cascade, so the DELETE event's old
+            // row can no longer pass RLS. Each notice names its former members.
+            final ids = payload.newRecord['member_ids'];
+            if (ids is List && myId != null && ids.contains(myId)) {
               _handleConversationGone();
             }
           },
@@ -368,13 +388,10 @@ class _ConversationScreenState extends State<ConversationScreen>
           latestPartner = message;
         }
       }
-      if (latestPartner != null &&
-          (initial ||
-              _lastReadThrough == null ||
-              latestPartner.createdAt.isAfter(_lastReadThrough!))) {
-        _lastReadThrough = latestPartner.createdAt;
-        _markReadSoon();
+      if (latestPartner != null) {
+        _requestRead(latestPartner.createdAt);
       }
+      if (_pendingRead) _markReadSoon();
     } catch (e) {
       if (!mounted || request != _messageRequest) return;
       if (initial) {
@@ -419,6 +436,7 @@ class _ConversationScreenState extends State<ConversationScreen>
       final older = await _app.api.getMessages(
         _conversationId,
         before: oldest.createdAt,
+        beforeId: oldest.id,
       );
       if (!mounted || _ended) return;
 
@@ -486,7 +504,7 @@ class _ConversationScreenState extends State<ConversationScreen>
       _sortMessages(_messages);
     });
     if (nearBottom) _scrollToBottom();
-    _lastReadThrough = message.createdAt;
+    _requestRead(message.createdAt);
     _markReadSoon();
     HapticFeedback.lightImpact();
   }
@@ -532,6 +550,17 @@ class _ConversationScreenState extends State<ConversationScreen>
     _ended = true;
     _endReason = reason;
     _cleanupLive();
+    // A recording can auto-send when its timer completes. Cancel it before
+    // leaving a burned or expired chat so no note is sent into a deleted row.
+    _recordTimer?.cancel();
+    _recordTimer = null;
+    if (_recording) {
+      _recording = false;
+      _recordStartedAt = null;
+      _recordElapsed = Duration.zero;
+      unawaited(_recorder.stop(cancel: true));
+    }
+    _pendingRead = false;
     unawaited(_stopPlayback());
     _app.removeConversation(_conversationId);
     unawaited(_app.refreshConversations(silent: true));
@@ -539,13 +568,35 @@ class _ConversationScreenState extends State<ConversationScreen>
     setState(() {});
   }
 
-  void _markReadSoon() {
+  void _requestRead(DateTime through) {
+    if (_lastReadThrough == null || through.isAfter(_lastReadThrough!)) {
+      _lastReadThrough = through;
+    }
+    // Keep the flag set until the server confirms the receipt.
+    _pendingRead = true;
+  }
+
+  void _markReadSoon({Duration delay = const Duration(milliseconds: 350)}) {
     _readDebounce?.cancel();
-    _readDebounce = Timer(const Duration(milliseconds: 350), () {
-      if (mounted && !_ended) {
-        unawaited(_app.markRead(_conversationId));
-      }
+    _readDebounce = Timer(delay, () {
+      if (mounted && !_ended && _pendingRead) unawaited(_flushRead());
     });
+  }
+
+  Future<void> _flushRead() async {
+    if (_readInFlight || !_pendingRead || _ended) return;
+    _readInFlight = true;
+    try {
+      final confirmed = await _app.markRead(_conversationId);
+      if (!mounted || _ended) return;
+      if (confirmed) {
+        _pendingRead = false;
+      } else {
+        _markReadSoon(delay: const Duration(seconds: 3));
+      }
+    } finally {
+      _readInFlight = false;
+    }
   }
 
   bool get _isNearBottom {
@@ -984,7 +1035,7 @@ class _ConversationScreenState extends State<ConversationScreen>
     _recordTimer = null;
     setState(() => _recording = false);
     final clip = await _recorder.stop(cancel: !send);
-    if (!mounted || !send) return;
+    if (!mounted || !send || _ended) return;
     if (clip == null) {
       showAppSnack(
         context,
@@ -1027,7 +1078,7 @@ class _ConversationScreenState extends State<ConversationScreen>
       } else {
         payload = await _app.api.getAttachment(message.id);
       }
-      if (!mounted) return;
+      if (!mounted || _ended) return;
 
       final mime = payload.mimeType.isEmpty
           ? (message.attachmentMime ?? 'audio/mp4')
@@ -1041,10 +1092,14 @@ class _ConversationScreenState extends State<ConversationScreen>
             : 'm4a';
       }
       final uri = await prepareAudio(payload.bytes, mime, extension);
+      if (!mounted || _ended) {
+        await cleanupAudio(uri);
+        return;
+      }
       _audioUri = uri;
       await _player.setUrl(uri.toString());
-      if (!mounted) {
-        await cleanupAudio(uri);
+      if (!mounted || _ended) {
+        await _stopPlayback();
         return;
       }
       setState(() {
@@ -1052,6 +1107,7 @@ class _ConversationScreenState extends State<ConversationScreen>
         _playingId = message.id;
       });
       await _player.play();
+      if (_ended) unawaited(_stopPlayback());
     } catch (e) {
       final uri = _audioUri;
       _audioUri = null;
@@ -1103,7 +1159,7 @@ class _ConversationScreenState extends State<ConversationScreen>
     setState(() => _openingImageId = message.id);
     try {
       final payload = await _app.api.getAttachment(message.id);
-      if (!mounted) return;
+      if (!mounted || _ended) return;
       setState(() {
         _messages = [
           for (final item in _messages)
@@ -1126,6 +1182,7 @@ class _ConversationScreenState extends State<ConversationScreen>
     String name,
     String mime,
   ) async {
+    if (!mounted || _ended) return;
     await Navigator.of(context).push(
       appPageRoute<void>(
         ImageViewerScreen(bytes: bytes, name: name, mimeType: mime),
@@ -1148,12 +1205,13 @@ class _ConversationScreenState extends State<ConversationScreen>
       } else {
         payload = await _app.api.getAttachment(message.id);
       }
+      if (!mounted || _ended) return;
       final result = await AttachmentSaver.save(
         name: payload.name,
         mime: payload.mimeType,
         bytes: payload.bytes,
       );
-      if (!mounted) return;
+      if (!mounted || _ended) return;
       showAppSnack(context, result);
     } catch (e) {
       if (!mounted) return;
@@ -1165,7 +1223,7 @@ class _ConversationScreenState extends State<ConversationScreen>
         error: true,
       );
     } finally {
-      if (mounted) setState(() => _savingId = null);
+      if (mounted && !_ended) setState(() => _savingId = null);
     }
   }
 

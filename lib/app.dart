@@ -145,25 +145,52 @@ class _ProvisionalAppState extends State<ProvisionalApp> {
 
   Future<void> _resetServer() async {
     if (widget.bakedConfig) return;
+
+    // Dispose the state while its Supabase client is still alive so channels
+    // can unsubscribe. Only change saved config after teardown succeeds.
+    final oldApp = _app;
+    if (mounted) {
+      setState(() {
+        _app = null;
+        _connecting = false;
+      });
+    }
+    oldApp?.dispose();
+
     try {
       if (Supabase.instance.isInitialized) {
         await Supabase.instance.dispose();
       }
-    } catch (_) {
-      // If disposal fails, a full restart still clears the saved config below.
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _startupError =
+              'The old connection could not be closed. Restart the app, then '
+              'try again. (${e.toString().length > 120 ? e.toString().substring(0, 120) : e})';
+        });
+      }
+      return;
     }
+    if (Supabase.instance.isInitialized) {
+      if (mounted) {
+        setState(() {
+          _startupError =
+              'The old connection is still active. Restart the app, then try '
+              'again.';
+        });
+      }
+      return;
+    }
+
     await widget.prefs.remove(_urlKey);
     await widget.prefs.remove(_keyKey);
     if (!mounted) return;
-    final oldApp = _app;
     setState(() {
-      _app = null;
       _url = '';
       _key = '';
       _connecting = false;
       _startupError = null;
     });
-    oldApp?.dispose();
   }
 
   String _connectionMessage(Object error) {
@@ -259,9 +286,6 @@ class AuthGate extends StatelessWidget {
           bakedConfig: bakedConfig,
           onRetry: app.initialize,
           onReset: onResetServer,
-          onStartOver: app.sessionUnusable
-              ? () => unawaited(app.startOver())
-              : null,
         );
     }
 

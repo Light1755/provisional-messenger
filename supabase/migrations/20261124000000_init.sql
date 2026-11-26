@@ -13,13 +13,15 @@
 --   * text, file, image, and voice-note messages
 --   * row level security so only the two members can read a conversation
 --   * RPCs for account creation, search, sending, burning, and expiry
---   * a pg_cron job that purges expired conversations every minute
---   * realtime for new messages, conversations, and read receipts
+--   * a pg_cron job that purges expired conversations in batches every minute
+--   * realtime for new messages, conversations, read receipts, and deletions
 --
 -- Privacy notes:
 --   * There is no message log table and no archive/restore path.
 --   * File bytes live in Postgres and are deleted by ON DELETE CASCADE.
 --   * Deleting a profile deletes every conversation the user belongs to.
+--   * Short-lived deletion notices carry only conversation and member ids so
+--     an open client can leave a burned chat immediately.
 --   * Message content is never placed in URLs or app logs.
 -- ============================================================================
 
@@ -36,6 +38,10 @@ create table if not exists public.profiles (
     check (username = lower(username) and username ~ '^[a-z0-9_]{3,24}$'),
   constraint profiles_username_key unique (username)
 );
+
+-- Enables index-backed prefix searches on the discover screen.
+create index if not exists profiles_username_pattern_idx
+  on public.profiles (username text_pattern_ops);
 
 create table if not exists public.conversations (
   id uuid primary key default gen_random_uuid(),
@@ -88,11 +94,11 @@ create table if not exists public.messages (
   constraint messages_voice_duration check (
     kind <> 'voice' or (duration_ms is not null and duration_ms between 500 and 600000)
   ),
-  constraint messages_client_id_key unique (sender_id, client_id)
+  constraint messages_client_id_key unique (conversation_id, sender_id, client_id)
 );
 
 create index if not exists messages_conversation_created_idx
-  on public.messages (conversation_id, created_at);
+  on public.messages (conversation_id, created_at, id);
 
 -- File bytes are separated from message metadata so Realtime never broadcasts
 -- the payload. Fetch on demand through get_attachment().
@@ -101,6 +107,19 @@ create table if not exists public.message_attachments (
   data bytea not null,
   constraint message_attachments_size check (octet_length(data) between 1 and 5242880)
 );
+
+-- A DELETE event's old conversation row cannot pass RLS after its member rows
+-- are cascaded away. This tombstone records the member ids before the delete so
+-- both clients receive a Realtime notice and can leave the chat immediately.
+-- It contains no message content and is removed by the purge job.
+create table if not exists public.conversation_deletions (
+  conversation_id uuid primary key,
+  member_ids uuid[] not null,
+  deleted_at timestamptz not null default now()
+);
+
+create index if not exists conversation_deletions_deleted_at_idx
+  on public.conversation_deletions (deleted_at);
 
 -- ---------------------------------------------------------------------------
 -- 2. Integrity triggers
@@ -121,8 +140,8 @@ begin
   from public.conversation_members
   where conversation_id = new.conversation_id;
 
-  if v_count > 2 then
-    raise exception 'A conversation can have at most two members'
+  if v_count <> 2 then
+    raise exception 'A conversation must have exactly two members'
       using errcode = '23514';
   end if;
 
@@ -160,6 +179,37 @@ drop trigger if exists profiles_burn_conversations on public.profiles;
 create trigger profiles_burn_conversations
 before delete on public.profiles
 for each row execute function public.handle_profile_delete();
+
+-- Capture the member list while it still exists so Realtime can deliver a
+-- DELETE notice after the cascades have removed the conversation row.
+create or replace function public.record_conversation_deletion()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+begin
+  insert into public.conversation_deletions (conversation_id, member_ids)
+  values (
+    old.id,
+    coalesce(
+      array(
+        select user_id
+        from public.conversation_members
+        where conversation_id = old.id
+      ),
+      '{}'::uuid[]
+    )
+  )
+  on conflict (conversation_id) do nothing;
+  return old;
+end;
+$$;
+
+drop trigger if exists conversations_record_deletion on public.conversations;
+create trigger conversations_record_deletion
+before delete on public.conversations
+for each row execute function public.record_conversation_deletion();
 
 -- ---------------------------------------------------------------------------
 -- 3. Access helpers
@@ -206,6 +256,7 @@ alter table public.conversations enable row level security;
 alter table public.conversation_members enable row level security;
 alter table public.messages enable row level security;
 alter table public.message_attachments enable row level security;
+alter table public.conversation_deletions enable row level security;
 
 drop policy if exists profiles_select on public.profiles;
 create policy profiles_select on public.profiles
@@ -244,6 +295,11 @@ create policy message_attachments_select on public.message_attachments
 for select to authenticated
 using (public.can_access_message(message_id));
 
+drop policy if exists conversation_deletions_select on public.conversation_deletions;
+create policy conversation_deletions_select on public.conversation_deletions
+for select to authenticated
+using (auth.uid() = any(member_ids));
+
 -- All writes go through the SECURITY DEFINER RPCs below. Direct table writes
 -- are denied, which keeps validation and cascading deletes in one place.
 revoke all on public.profiles from anon, authenticated;
@@ -251,12 +307,14 @@ revoke all on public.conversations from anon, authenticated;
 revoke all on public.conversation_members from anon, authenticated;
 revoke all on public.messages from anon, authenticated;
 revoke all on public.message_attachments from anon, authenticated;
+revoke all on public.conversation_deletions from anon, authenticated;
 
 grant select on public.profiles to authenticated;
 grant select on public.conversations to authenticated;
 grant select on public.conversation_members to authenticated;
 grant select on public.messages to authenticated;
 grant select on public.message_attachments to authenticated;
+grant select on public.conversation_deletions to authenticated;
 
 -- ---------------------------------------------------------------------------
 -- 5. Account RPCs
@@ -277,7 +335,7 @@ begin
     raise exception 'not_authenticated' using errcode = '28000';
   end if;
 
-  if v_username !~ '^[a-z0-9_]{3,24}$' then
+  if v_username is null or v_username !~ '^[a-z0-9_]{3,24}$' then
     raise exception 'invalid_username' using errcode = '22023';
   end if;
 
@@ -302,6 +360,11 @@ begin
     returning * into v_profile;
   exception
     when unique_violation then
+      -- Two simultaneous calls can both pass the pre-check. If this user now
+      -- owns a profile, let the client adopt it instead of showing "taken".
+      if exists (select 1 from public.profiles where id = v_uid) then
+        raise exception 'profile_exists' using errcode = 'P0001';
+      end if;
       raise exception 'username_taken' using errcode = 'P0001';
   end;
 
@@ -340,8 +403,15 @@ begin
     raise exception 'not_authenticated' using errcode = '28000';
   end if;
 
-  -- Require two characters and forbid wildcards/enumeration tricks.
-  if length(v_query) < 2 or v_query !~ '^[a-z0-9_]{2,24}$' then
+  if not exists (select 1 from public.profiles where id = v_uid) then
+    raise exception 'profile_not_found' using errcode = 'P0002';
+  end if;
+
+  -- Three characters matches the minimum username length and keeps two-letter
+  -- enumeration useless. Underscore is escaped because it is a LIKE wildcard.
+  if v_query is null
+     or length(v_query) < 3
+     or v_query !~ '^[a-z0-9_]{3,24}$' then
     return;
   end if;
 
@@ -349,7 +419,8 @@ begin
   select p.id, p.username, p.accent
   from public.profiles p
   where p.id <> v_uid
-    and starts_with(p.username, v_query)
+    and p.username like
+      replace(replace(v_query, '\', '\\'), '_', '\_') || '%' escape '\'
   order by (p.username = v_query) desc, p.username asc
   limit 20;
 end;
@@ -385,8 +456,10 @@ begin
   exception
     when others then
       -- Profile and conversation deletion already succeeded. The remaining
-      -- auth row is an opaque UUID with no username or content.
-      null;
+      -- auth row is an opaque UUID with no username or content, but surface
+      -- the failure so operators can see it in the database logs.
+      raise notice 'profile % burned, but auth user % could not be deleted: %',
+        v_uid, v_uid, sqlerrm;
   end;
 end;
 $$;
@@ -412,6 +485,10 @@ declare
 begin
   if v_uid is null then
     raise exception 'not_authenticated' using errcode = '28000';
+  end if;
+
+  if not exists (select 1 from public.profiles where id = v_uid) then
+    raise exception 'profile_not_found' using errcode = 'P0002';
   end if;
 
   if p_other_user_id is null or p_other_user_id = v_uid then
@@ -477,7 +554,9 @@ begin
     raise exception 'not_authenticated' using errcode = '28000';
   end if;
 
-  if p_expiry_seconds < 300 or p_expiry_seconds > 2592000 then
+  if p_expiry_seconds is null
+     or p_expiry_seconds < 300
+     or p_expiry_seconds > 2592000 then
     raise exception 'invalid_expiry' using errcode = '22023';
   end if;
 
@@ -669,7 +748,9 @@ begin
 
   select * into v_msg
   from public.messages
-  where sender_id = v_uid and client_id = p_client_id;
+  where conversation_id = p_conversation_id
+    and sender_id = v_uid
+    and client_id = p_client_id;
 
   if found then
     return v_msg;
@@ -683,7 +764,9 @@ begin
     when unique_violation then
       select * into v_msg
       from public.messages
-      where sender_id = v_uid and client_id = p_client_id;
+      where conversation_id = p_conversation_id
+        and sender_id = v_uid
+        and client_id = p_client_id;
       if not found then
         raise;
       end if;
@@ -693,10 +776,6 @@ begin
   update public.conversations
   set updated_at = now()
   where id = p_conversation_id;
-
-  update public.conversation_members
-  set last_read_at = now()
-  where conversation_id = p_conversation_id and user_id = v_uid;
 
   return v_msg;
 end;
@@ -777,7 +856,9 @@ begin
 
   select * into v_msg
   from public.messages
-  where sender_id = v_uid and client_id = p_client_id;
+  where conversation_id = p_conversation_id
+    and sender_id = v_uid
+    and client_id = p_client_id;
 
   if found then
     return v_msg;
@@ -800,7 +881,9 @@ begin
     when unique_violation then
       select * into v_msg
       from public.messages
-      where sender_id = v_uid and client_id = p_client_id;
+      where conversation_id = p_conversation_id
+        and sender_id = v_uid
+        and client_id = p_client_id;
       if not found then
         raise;
       end if;
@@ -810,10 +893,6 @@ begin
   update public.conversations
   set updated_at = now()
   where id = p_conversation_id;
-
-  update public.conversation_members
-  set last_read_at = now()
-  where conversation_id = p_conversation_id and user_id = v_uid;
 
   return v_msg;
 end;
@@ -839,10 +918,13 @@ as $$
     and public.is_conversation_member(m.conversation_id);
 $$;
 
+drop function if exists public.get_messages(uuid, timestamptz, integer);
+
 create or replace function public.get_messages(
   p_conversation_id uuid,
   p_before timestamptz default null,
-  p_limit integer default 100
+  p_limit integer default 100,
+  p_before_id uuid default null
 )
 returns table (
   message_id uuid,
@@ -869,7 +951,7 @@ as $$
   select *
   from (
     select
-      m.id,
+      m.id as message_id,
       m.conversation_id,
       m.sender_id,
       p.username,
@@ -897,11 +979,17 @@ as $$
     join public.profiles p on p.id = m.sender_id
     where m.conversation_id = p_conversation_id
       and public.is_conversation_member(m.conversation_id)
-      and (p_before is null or m.created_at < p_before)
-    order by m.created_at desc
+      and (
+        p_before is null
+        or (m.created_at, m.id) < (
+          p_before,
+          coalesce(p_before_id, 'ffffffff-ffff-ffff-ffff-ffffffffffff'::uuid)
+        )
+      )
+    order by m.created_at desc, m.id desc
     limit greatest(1, least(coalesce(p_limit, 100), 200))
   ) recent
-  order by recent.created_at asc;
+  order by recent.created_at asc, recent.message_id asc;
 $$;
 
 -- ---------------------------------------------------------------------------
@@ -917,12 +1005,23 @@ as $$
 declare
   v_count integer;
 begin
-  with deleted as (
-    delete from public.conversations
+  -- Delete in bounded batches so a backlog cannot lock the whole table or
+  -- blow up the WAL in one cron run. The next minute picks up the rest.
+  with batch as (
+    select id
+    from public.conversations
     where expires_at <= now()
+    order by expires_at
+    limit 1000
+  ), deleted as (
+    delete from public.conversations
+    where id in (select id from batch)
     returning 1
   )
   select count(*) into v_count from deleted;
+
+  delete from public.conversation_deletions
+  where deleted_at < now() - interval '1 hour';
 
   return v_count;
 end;
@@ -936,21 +1035,31 @@ $$;
 -- SQL has been installed, before any account is created.
 create or replace function public.health_check()
 returns jsonb
-language sql
+language plpgsql
 stable
 security definer
 set search_path = public, pg_temp
 as $$
-  select jsonb_build_object(
+declare
+  v_cron_ok boolean := false;
+begin
+  if to_regclass('cron.job') is not null then
+    execute 'select exists (select 1 from cron.job where jobname = $1)'
+      into v_cron_ok using 'provisional-purge-expired';
+  end if;
+
+  return jsonb_build_object(
     'ok',
-    to_regclass('public.profiles') is not null
+      to_regclass('public.profiles') is not null
       and to_regclass('public.conversations') is not null
       and to_regclass('public.conversation_members') is not null
       and to_regclass('public.messages') is not null
       and to_regclass('public.message_attachments') is not null,
     'app', 'provisional-messenger',
-    'schema_version', 1
+    'schema_version', 2,
+    'cron_ok', v_cron_ok
   );
+end;
 $$;
 
 -- ---------------------------------------------------------------------------
@@ -970,10 +1079,13 @@ revoke all on function public.get_conversation(uuid) from public, anon;
 revoke all on function public.send_text_message(uuid, uuid, text) from public, anon;
 revoke all on function public.send_attachment_message(uuid, uuid, text, text, text, integer, text) from public, anon;
 revoke all on function public.get_attachment(uuid) from public, anon;
-revoke all on function public.get_messages(uuid, timestamptz, integer) from public, anon;
+revoke all on function public.get_messages(uuid, timestamptz, integer, uuid) from public, anon;
 revoke all on function public.purge_expired_conversations() from public, anon, authenticated;
 revoke all on function public.is_conversation_member(uuid) from public, anon;
 revoke all on function public.can_access_message(uuid) from public, anon;
+revoke all on function public.check_conversation_member_count() from public, anon, authenticated;
+revoke all on function public.handle_profile_delete() from public, anon, authenticated;
+revoke all on function public.record_conversation_deletion() from public, anon, authenticated;
 revoke all on function public.health_check() from public, anon;
 
 grant execute on function public.create_profile(text) to authenticated;
@@ -989,7 +1101,7 @@ grant execute on function public.get_conversation(uuid) to authenticated;
 grant execute on function public.send_text_message(uuid, uuid, text) to authenticated;
 grant execute on function public.send_attachment_message(uuid, uuid, text, text, text, integer, text) to authenticated;
 grant execute on function public.get_attachment(uuid) to authenticated;
-grant execute on function public.get_messages(uuid, timestamptz, integer) to authenticated;
+grant execute on function public.get_messages(uuid, timestamptz, integer, uuid) to authenticated;
 grant execute on function public.is_conversation_member(uuid) to authenticated;
 grant execute on function public.can_access_message(uuid) to authenticated;
 grant execute on function public.health_check() to anon, authenticated;
@@ -1026,6 +1138,15 @@ begin
         and tablename = 'conversation_members'
     ) then
       execute 'alter publication supabase_realtime add table public.conversation_members';
+    end if;
+
+    if not exists (
+      select 1 from pg_publication_tables
+      where pubname = 'supabase_realtime'
+        and schemaname = 'public'
+        and tablename = 'conversation_deletions'
+    ) then
+      execute 'alter publication supabase_realtime add table public.conversation_deletions';
     end if;
   exception
     when undefined_object then

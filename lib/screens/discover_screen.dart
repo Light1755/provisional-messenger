@@ -60,7 +60,7 @@ class _DiscoverScreenState extends State<DiscoverScreen> {
     // Invalidate any search that is already in flight so an older prefix can
     // never overwrite results for what is now in the field.
     _request++;
-    if (normalized.length < 2) {
+    if (normalized.length < 3) {
       setState(() {
         _results = const [];
         _searching = false;
@@ -77,7 +77,7 @@ class _DiscoverScreenState extends State<DiscoverScreen> {
   Future<void> _search() async {
     _debounce?.cancel();
     final query = normalizeUsername(_controller.text);
-    if (query.length < 2) return;
+    if (query.length < 3) return;
 
     final app = context.read<AppState>();
     final request = ++_request;
@@ -322,7 +322,7 @@ class _DiscoverScreenState extends State<DiscoverScreen> {
   Widget _buildBody(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
 
-    if (_query.length < 2) {
+    if (_query.length < 3) {
       return ListView(
         keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
         physics: const AlwaysScrollableScrollPhysics(),
@@ -332,7 +332,7 @@ class _DiscoverScreenState extends State<DiscoverScreen> {
             icon: Icons.person_search_outlined,
             title: 'Search a username',
             body:
-                'Type at least 2 characters. Matching usernames start with '
+                'Type at least 3 characters. Matching usernames start with '
                 'what you type, so a unique prefix is enough.',
             action: Container(
               padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
@@ -369,16 +369,6 @@ class _DiscoverScreenState extends State<DiscoverScreen> {
       );
     }
 
-    if (_error != null) {
-      return ListView(
-        physics: const AlwaysScrollableScrollPhysics(),
-        padding: const EdgeInsets.fromLTRB(22, 24, 22, 24),
-        children: [
-          ErrorNotice(message: _error!, onRetry: () => unawaited(_search())),
-        ],
-      );
-    }
-
     if (_searching && _results.isEmpty) {
       return ListView(
         physics: const NeverScrollableScrollPhysics(),
@@ -393,7 +383,7 @@ class _DiscoverScreenState extends State<DiscoverScreen> {
       );
     }
 
-    if (_searched && _results.isEmpty) {
+    if (_searched && _results.isEmpty && _error == null) {
       return ListView(
         physics: const AlwaysScrollableScrollPhysics(),
         padding: const EdgeInsets.only(top: 36),
@@ -409,14 +399,22 @@ class _DiscoverScreenState extends State<DiscoverScreen> {
       );
     }
 
+    final hasError = _error != null;
     return ListView.separated(
       keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
       physics: const AlwaysScrollableScrollPhysics(),
       padding: const EdgeInsets.fromLTRB(16, 10, 16, 26),
-      itemCount: _results.length,
-      separatorBuilder: (_, __) => const SizedBox(height: 9),
+      itemCount: _results.length + (hasError ? 1 : 0),
+      separatorBuilder: (_, index) =>
+          SizedBox(height: hasError && index == 0 ? 14 : 9),
       itemBuilder: (context, index) {
-        final result = _results[index];
+        if (hasError && index == 0) {
+          return ErrorNotice(
+            message: _error!,
+            onRetry: () => unawaited(_search()),
+          );
+        }
+        final result = _results[index - (hasError ? 1 : 0)];
         final existing = _existingWith(result.id);
         final busy = _busyId == result.id;
         return Material(

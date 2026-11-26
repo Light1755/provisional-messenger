@@ -430,82 +430,13 @@ class StartupErrorScreen extends StatelessWidget {
     required this.message,
     required this.onRetry,
     this.onReset,
-    this.onStartOver,
     this.bakedConfig = false,
   });
 
   final String message;
   final VoidCallback onRetry;
   final VoidCallback? onReset;
-  final VoidCallback? onStartOver;
   final bool bakedConfig;
-
-  Future<void> _confirmStartOver(BuildContext context) async {
-    final confirmed = await showAppSheet<bool>(
-      context,
-      child: Padding(
-        padding: const EdgeInsets.fromLTRB(22, 16, 22, 20),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                const SoftIcon(
-                  icon: Icons.person_off_outlined,
-                  color: kDanger,
-                  size: 46,
-                  iconSize: 22,
-                ),
-                const SizedBox(width: 13),
-                Expanded(
-                  child: Text(
-                    'Start a new session?',
-                    style: TextStyle(
-                      fontSize: 21,
-                      fontWeight: FontWeight.w800,
-                      letterSpacing: -.6,
-                      color: Theme.of(context).colorScheme.onSurface,
-                    ),
-                  ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 16),
-            Text(
-              'This device will lose access to the current profile and its '
-              'conversations. The old profile stays on the server until its '
-              'chats expire, but this app cannot open it again. There is no '
-              'recovery.',
-              style: TextStyle(
-                fontSize: 13.5,
-                height: 1.55,
-                color: Theme.of(
-                  context,
-                ).colorScheme.onSurface.withValues(alpha: .62),
-              ),
-            ),
-            const SizedBox(height: 18),
-            PrimaryButton(
-              label: 'Abandon this session',
-              danger: true,
-              onPressed: () => Navigator.of(context).pop(true),
-            ),
-            const SizedBox(height: 10),
-            SizedBox(
-              width: double.infinity,
-              height: 48,
-              child: TextButton(
-                onPressed: () => Navigator.of(context).pop(false),
-                child: const Text('Cancel'),
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-    if (confirmed == true) onStartOver?.call();
-  }
 
   @override
   Widget build(BuildContext context) {
@@ -561,13 +492,6 @@ class StartupErrorScreen extends StatelessWidget {
                         onPressed: onReset,
                         child: const Text('Change server settings'),
                       ),
-                    ),
-                  ],
-                  if (onStartOver != null) ...[
-                    const SizedBox(height: 4),
-                    TextButton(
-                      onPressed: () => _confirmStartOver(context),
-                      child: const Text('Start a new session'),
                     ),
                   ],
                   const SizedBox(height: 24),
