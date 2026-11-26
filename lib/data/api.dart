@@ -229,6 +229,11 @@ class Api {
         );
       });
 
+  /// Postgres `encode(data, 'base64')` inserts a newline every 76 characters.
+  /// Dart's strict base64 decoder rejects those line breaks.
+  static Uint8List decodeAttachmentBase64(String raw) =>
+      base64Decode(raw.replaceAll(RegExp(r'\s+'), ''));
+
   Future<AttachmentPayload> getAttachment(String messageId) => _guard(() async {
         final res = await _c.rpc('get_attachment',
             params: {'p_message_id': messageId}).timeout(_attachmentTimeout);
@@ -241,10 +246,18 @@ class Api {
         if (raw is! String) {
           throw ApiException('That attachment is no longer available.');
         }
+        final Uint8List bytes;
+        try {
+          bytes = decodeAttachmentBase64(raw);
+        } on FormatException {
+          throw ApiException(
+            'That attachment could not be read. Ask the sender to try again.',
+          );
+        }
         return AttachmentPayload(
           name: row['file_name'] as String? ?? 'attachment',
           mimeType: row['mime_type'] as String? ?? 'application/octet-stream',
-          bytes: base64Decode(raw),
+          bytes: bytes,
         );
       });
 

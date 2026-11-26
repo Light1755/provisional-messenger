@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:provisional_messenger/data/api.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
@@ -148,6 +150,16 @@ void main() {
         isTrue,
       );
       expect(Api.burnResultSucceeded({'content_deleted': false}), isFalse);
+    });
+
+    test('attachment decoding ignores Postgres base64 line breaks', () {
+      final original = List<int>.generate(240, (i) => i);
+      final encoded = base64Encode(original);
+      final wrapped = encoded.replaceAllMapped(
+        RegExp(r'.{1,76}'),
+        (match) => '${match.group(0)}\n',
+      );
+      expect(Api.decodeAttachmentBase64(wrapped), original);
     });
   });
 }
