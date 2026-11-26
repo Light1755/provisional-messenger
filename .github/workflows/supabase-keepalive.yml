@@ -46,6 +46,6 @@ jobs:
           # Any mismatch (including a missing field) fails the workflow.
           check_field ok true
           check_field cron_ok true
-          check_field schema_version 5
+          check_field schema_version 6
 
           printf '%s\n' "$response" | jq -c '{ok, cron_ok, schema_version, app}'

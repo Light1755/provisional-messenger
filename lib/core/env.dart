@@ -13,7 +13,7 @@ class Env {
       String.fromEnvironment('SUPABASE_ANON_KEY');
 
   static const String appName = 'Provisional Messenger';
-  static const String appVersion = '1.1.0';
+  static const String appVersion = '1.1.1';
 
   /// Hard cap for one file/voice note. The database enforces the same limit.
   static const int maxAttachmentBytes = 5 * 1024 * 1024;

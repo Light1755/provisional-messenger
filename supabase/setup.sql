@@ -15,6 +15,7 @@
 --   * row level security so only the two members can read a conversation
 --   * RPCs for account creation, search, sending, burning, and expiry
 --   * a pg_cron job that purges expired conversations in batches every minute
+--   * a pg_cron job that expires profiles inactive for 48 hours every hour
 --   * realtime for new messages, conversations, read receipts, and deletions
 --
 -- Privacy notes:
@@ -1429,6 +1430,37 @@ begin
 end;
 $$;
 
+-- A profile is released for reuse after 48 hours without a presence check-in.
+-- touch_presence() keeps an open app active. The auth row is deliberately left
+-- in place so the same device can claim a new username. The
+-- profiles_burn_conversations trigger removes the person's chats and content.
+drop function if exists public.expire_inactive_profiles();
+
+create or replace function public.expire_inactive_profiles()
+returns integer
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  v_count integer;
+begin
+  with expired as (
+    select p.id
+    from public.profiles p
+    left join public.user_presence up on up.user_id = p.id
+    where coalesce(up.last_seen, p.created_at) < now() - interval '48 hours'
+  ), deleted as (
+    delete from public.profiles p
+    where p.id in (select id from expired)
+    returning 1
+  )
+  select count(*) into v_count from deleted;
+
+  return v_count;
+end;
+$$;
+
 -- ---------------------------------------------------------------------------
 -- 9. Connection probe
 -- ---------------------------------------------------------------------------
@@ -1465,6 +1497,8 @@ set search_path = ''
 as $$
 declare
   v_cron_schema text;
+  v_purge_ok boolean := false;
+  v_expire_ok boolean := false;
   v_cron_ok boolean := false;
 begin
   v_cron_schema := public.cron_schema_name();
@@ -1473,7 +1507,14 @@ begin
     execute format(
       'select exists (select 1 from %I.job where jobname = $1 and active)',
       v_cron_schema
-    ) into v_cron_ok using 'provisional-purge-expired';
+    ) into v_purge_ok using 'provisional-purge-expired';
+
+    execute format(
+      'select exists (select 1 from %I.job where jobname = $1 and active)',
+      v_cron_schema
+    ) into v_expire_ok using 'provisional-expire-inactive-profiles';
+
+    v_cron_ok := v_purge_ok and v_expire_ok;
   end if;
 
   return jsonb_build_object(
@@ -1484,7 +1525,7 @@ begin
       and to_regclass('public.messages') is not null
       and to_regclass('public.message_attachments') is not null,
     'app', 'provisional-messenger',
-    'schema_version', 5,
+    'schema_version', 6,
     'cron_ok', v_cron_ok,
     'server_now', now()
   );
@@ -1516,6 +1557,7 @@ revoke all on function public.remove_reaction(uuid, text) from public, anon;
 revoke all on function public.touch_presence() from public, anon;
 revoke all on function public.get_partner_presence(uuid) from public, anon;
 revoke all on function public.purge_expired_conversations() from public, anon, authenticated;
+revoke all on function public.expire_inactive_profiles() from public, anon, authenticated;
 revoke all on function public.is_conversation_member(uuid) from public, anon;
 revoke all on function public.can_access_message(uuid) from public, anon;
 revoke all on function public.check_conversation_member_count() from public, anon, authenticated;
@@ -1656,6 +1698,46 @@ begin
         'select public.purge_expired_conversations();';
   else
     raise notice 'pg_cron is not installed. Enable it under Database -> Extensions, then re-run section 12.';
+  end if;
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- 12b. Hourly inactive-profile expiry
+-- ---------------------------------------------------------------------------
+
+do $$
+declare
+  v_cron_schema text;
+  v_job_exists boolean := false;
+begin
+  begin
+    create extension if not exists pg_cron;
+  exception
+    when others then
+      raise notice 'pg_cron could not be enabled. Enable it under Database -> Extensions, then re-run section 12b.';
+  end;
+
+  v_cron_schema := public.cron_schema_name();
+
+  if v_cron_schema is not null then
+    execute format(
+      'select exists (select 1 from %I.job where jobname = $1)',
+      v_cron_schema
+    ) into v_job_exists using 'provisional-expire-inactive-profiles';
+
+    if v_job_exists then
+      execute format('select %I.unschedule($1)', v_cron_schema)
+        using 'provisional-expire-inactive-profiles';
+    end if;
+
+    execute format('select %I.schedule($1, $2, $3)', v_cron_schema)
+      using
+        'provisional-expire-inactive-profiles',
+        '0 * * * *',
+        'select public.expire_inactive_profiles();';
+  else
+    raise notice 'pg_cron is not installed. Enable it under Database -> Extensions, then re-run section 12b.';
   end if;
 end;
 $$;

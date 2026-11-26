@@ -145,7 +145,9 @@ class PrivacyScreen extends StatelessWidget {
                               'password. Clearing app data or losing the device '
                               'means losing access. Anyone who knows your '
                               'username can still start a new conversation with '
-                              'you while your profile exists.',
+                              'you while your profile exists. A profile unused '
+                              'for 48 hours is deleted and its username becomes '
+                              'available again.',
                               style: TextStyle(
                                 fontSize: 12.5,
                                 height: 1.5,

@@ -354,8 +354,9 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
               const SizedBox(height: 9),
               Center(
                 child: Text(
-                  'This is how people find you. It is unique, public to anyone '
-                  'who searches it, and yours until you burn it.',
+                  'This is how people find you. It is unique and public to '
+                  'anyone who searches it. It is removed if unused for 48 hours, '
+                  'then anyone can claim it.',
                   textAlign: TextAlign.center,
                   style: TextStyle(
                     fontSize: 13.5,
@@ -456,9 +457,10 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
                     const SizedBox(width: 10),
                     Expanded(
                       child: Text(
-                        'No password. Your session is tied to this device. If '
-                        'you clear app data or lose this device, the username '
-                        'cannot be recovered. You can burn it any time.',
+                        'No password. Your session is tied to this device. '
+                        'If you clear app data or lose it, the username cannot '
+                        'be recovered. Burn it any time, or leave it unused for '
+                        '48 hours to release it.',
                         style: TextStyle(
                           fontSize: 11.5,
                           height: 1.5,

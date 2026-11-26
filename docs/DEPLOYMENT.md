@@ -25,7 +25,7 @@ where jobname = 'provisional-purge-expired';
 select public.health_check();
 ```
 
-The job should be active on `* * * * *`. The health check should return `"ok": true`, `"cron_ok": true`, and `"schema_version": 5`. The keep-alive workflow fails on any mismatch.
+The job should be active on `* * * * *`. The health check should return `"ok": true`, `"cron_ok": true`, and `"schema_version": 6`. The keep-alive workflow fails on any mismatch.
 
 6. Open Project Settings, API. Copy the Project URL and the anon public key.
 
@@ -67,7 +67,7 @@ flutter build apk --release \
   --dart-define=SUPABASE_ANON_KEY=YOUR_ANON_OR_PUBLISHABLE_KEY
 ```
 
-Version 1.1.0 has `versionCode = 6` and `versionName = "1.1.0"`, pinned in `android/app/build.gradle.kts` and matching `pubspec.yaml` (`1.1.0+6`). The APK lands at `build/app/outputs/flutter-apk/app-release.apk`; copy it to `provisional-messenger-v1.1.0.apk` for upload. Release builds use the signing config described below and fail with a clear Gradle error when it is missing; they never fall back to debug signing. Debug builds work with no keystore. The application id is `com.light1755.provisionalmessenger`; keep this id and the same signing key for all future updates.
+Version 1.1.1 has `versionCode = 7` and `versionName = "1.1.1"`, pinned in `android/app/build.gradle.kts` and matching `pubspec.yaml` (`1.1.1+7`). The APK lands at `build/app/outputs/flutter-apk/app-release.apk`; copy it to `provisional-messenger-v1.1.1.apk` for upload. Release builds use the signing config described below and fail with a clear Gradle error when it is missing; they never fall back to debug signing. Debug builds work with no keystore. The application id is `com.light1755.provisionalmessenger`; keep this id and the same signing key for all future updates.
 
 ### Create a release keystore
 
@@ -107,12 +107,12 @@ flutter build appbundle --release \
   --dart-define=SUPABASE_ANON_KEY=YOUR_ANON_OR_PUBLISHABLE_KEY
 ```
 
-Copy the bundle to `provisional-messenger-v1.1.0.aab` for upload. CI checks that both outputs exist, are non-trivial in size, and logs their SHA-256 digests.
+Copy the bundle to `provisional-messenger-v1.1.1.aab` for upload. CI checks that both outputs exist, are non-trivial in size, and logs their SHA-256 digests.
 
 ### Publish the APK
 
-1. Open the repository's Releases page in an authenticated browser session, or use a fine-grained PAT with `Contents` and `Releases` write access for API/CLI publishing. Create a tag such as `v1.1.0`.
-2. Attach `provisional-messenger-v1.1.0.apk` (and the `.aab` if you distribute through a store).
+1. Open the repository's Releases page in an authenticated browser session, or use a fine-grained PAT with `Contents` and `Releases` write access for API/CLI publishing. Create a tag such as `v1.1.1`.
+2. Attach `provisional-messenger-v1.1.1.apk` (and the `.aab` if you distribute through a store).
 3. Include the signing certificate fingerprint and the supported Android version in the release notes. Read the fingerprint with:
    ```bash
    keytool -list -v -keystore /path/to/provisional-release.jks -alias provisional | grep SHA-256
@@ -125,7 +125,7 @@ Free projects pause after roughly a week without activity. The workflow is [`.gi
 
 1. Add the same `SUPABASE_URL` and `SUPABASE_ANON_KEY` variables or secrets used by the web deploy. If unset, the workflow falls back to this project's public URL and publishable key.
 2. Open Actions, select Supabase keep-alive, and run it once. The log prints only `ok`, `cron_ok`, `schema_version`, and `app`.
-3. Leave the schedule in place. It runs every three days and can also be started manually. The step fails if `ok` or `cron_ok` is not `true`, or `schema_version` is not `5`.
+3. Leave the schedule in place. It runs every three days and can also be started manually. The step fails if `ok` or `cron_ok` is not `true`, or `schema_version` is not `6`.
 
 The job calls `/rest/v1/rpc/health_check` with the publishable/anon key. The function is executable by `anon`, reads no user data, and reports table presence, cron status, and schema version.
 
@@ -135,13 +135,13 @@ GitHub can delay scheduled jobs, and it disables schedules after 60 days without
 
 - `flutter analyze --fatal-infos` reports no issues and `flutter test` passes.
 - The web and signed Android CI build jobs pass; artifact SHA-256 digests are recorded.
-- `pubspec.yaml` is `1.1.0+6`, `Env.appVersion` is `1.1.0`, and the Gradle version is `6` / `1.1.0`.
+- `pubspec.yaml` is `1.1.1+7`, `Env.appVersion` is `1.1.1`, and the Gradle version is `7` / `1.1.1`.
 - Two devices or two browser profiles can create profiles, chat, send every message type, read receipts, change the timer, burn a chat, and burn a profile.
 - After a profile is created, the device has no logout or start-over control; only a successful profile burn returns it to username creation.
 - Expiry is tested by moving `expires_at` forward, not only by waiting.
 - The production build uses the anon or publishable key, never a server key; CI rejects empty or wrong values before building.
 - The web workflow completed, the site loads from `/provisional-messenger/`, and a hard reload picked up the new build (no app-specific service worker).
-- `provisional-messenger-v1.1.0.apk` and `provisional-messenger-v1.1.0.aab` are signed with the key you intend to keep using, and the signing fingerprint is in the release notes.
+- `provisional-messenger-v1.1.1.apk` and `provisional-messenger-v1.1.1.aab` are signed with the key you intend to keep using, and the signing fingerprint is in the release notes.
 - GitHub publishing uses browser auth or a fine-grained PAT with `Contents` and `Releases`.
 - `PRIVACY.md` is published and matches the deployment. The person operating the deployment is responsible for the notice and for any contact details it requires.
-- The Supabase keep-alive run succeeded with `ok: true`, `cron_ok: true`, and `schema_version: 4`.
+- The Supabase keep-alive run succeeded with `ok: true`, `cron_ok: true`, and `schema_version: 6`.
