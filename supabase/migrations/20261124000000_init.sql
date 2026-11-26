@@ -10,7 +10,7 @@
 -- What this file creates:
 --   * username-only profiles tied to Supabase anonymous auth users
 --   * two-person conversations with a fixed expiry countdown
---   * text, file, image, and voice-note messages
+--   * text, file (including images), and voice-note messages
 --   * row level security so only the two members can read a conversation
 --   * RPCs for account creation, search, sending, burning, and expiry
 --   * a pg_cron job that purges expired conversations in batches every minute
@@ -131,7 +131,7 @@ create or replace function public.check_conversation_member_count()
 returns trigger
 language plpgsql
 security definer
-set search_path = public, pg_temp
+set search_path = ''
 as $$
 declare
   v_count integer;
@@ -162,7 +162,7 @@ create or replace function public.handle_profile_delete()
 returns trigger
 language plpgsql
 security definer
-set search_path = public, pg_temp
+set search_path = ''
 as $$
 begin
   delete from public.conversations
@@ -186,7 +186,7 @@ create or replace function public.record_conversation_deletion()
 returns trigger
 language plpgsql
 security definer
-set search_path = public, pg_temp
+set search_path = ''
 as $$
 begin
   insert into public.conversation_deletions (conversation_id, member_ids)
@@ -220,7 +220,7 @@ returns boolean
 language sql
 stable
 security definer
-set search_path = public, pg_temp
+set search_path = ''
 as $$
   select exists (
     select 1
@@ -237,7 +237,7 @@ returns boolean
 language sql
 stable
 security definer
-set search_path = public, pg_temp
+set search_path = ''
 as $$
   select exists (
     select 1
@@ -324,7 +324,7 @@ create or replace function public.create_profile(p_username text)
 returns public.profiles
 language plpgsql
 security definer
-set search_path = public, pg_temp
+set search_path = ''
 as $$
 declare
   v_uid uuid := auth.uid();
@@ -379,7 +379,7 @@ returns setof public.profiles
 language sql
 stable
 security definer
-set search_path = public, pg_temp
+set search_path = ''
 as $$
   select * from public.profiles where id = auth.uid();
 $$;
@@ -393,7 +393,7 @@ returns table (
 language plpgsql
 stable
 security definer
-set search_path = public, pg_temp
+set search_path = ''
 as $$
 declare
   v_uid uuid := auth.uid();
@@ -415,12 +415,14 @@ begin
     return;
   end if;
 
+  -- v_query is already restricted to [a-z0-9_], so only underscore needs
+  -- escaping. Rely on PostgreSQL's default backslash escape: unlike an explicit
+  -- ESCAPE clause, this stays index-friendly for the text_pattern_ops index.
   return query
   select p.id, p.username, p.accent
   from public.profiles p
   where p.id <> v_uid
-    and p.username like
-      replace(replace(v_query, '\', '\\'), '_', '\_') || '%' escape '\'
+    and p.username like replace(v_query, '_', '\_') || '%'
   order by (p.username = v_query) desc, p.username asc
   limit 20;
 end;
@@ -429,14 +431,19 @@ $$;
 -- Best-effort full account removal. The profile and all content are deleted
 -- first; deleting the opaque Supabase anonymous auth row is attempted last.
 -- If the SQL role cannot touch auth.users, the content deletion still stands.
+-- Dropped first because the return type changed from void to jsonb; PostgreSQL
+-- cannot change an existing function's return type with CREATE OR REPLACE.
+drop function if exists public.burn_profile();
+
 create or replace function public.burn_profile()
-returns void
+returns jsonb
 language plpgsql
 security definer
-set search_path = public, pg_temp
+set search_path = ''
 as $$
 declare
   v_uid uuid := auth.uid();
+  v_auth_deleted boolean := false;
 begin
   if v_uid is null then
     raise exception 'not_authenticated' using errcode = '28000';
@@ -453,14 +460,20 @@ begin
 
   begin
     delete from auth.users where id = v_uid;
+    v_auth_deleted := true;
   exception
     when others then
-      -- Profile and conversation deletion already succeeded. The remaining
-      -- auth row is an opaque UUID with no username or content, but surface
-      -- the failure so operators can see it in the database logs.
+      -- Content deletion has already committed inside this transaction. The
+      -- remaining auth row is opaque and has no profile, but report the result
+      -- instead of silently pretending the whole identity was removed.
       raise notice 'profile % burned, but auth user % could not be deleted: %',
         v_uid, v_uid, sqlerrm;
   end;
+
+  return jsonb_build_object(
+    'content_deleted', true,
+    'auth_deleted', v_auth_deleted
+  );
 end;
 $$;
 
@@ -475,7 +488,7 @@ create or replace function public.start_conversation(
 returns uuid
 language plpgsql
 security definer
-set search_path = public, pg_temp
+set search_path = ''
 as $$
 declare
   v_uid uuid := auth.uid();
@@ -544,7 +557,7 @@ create or replace function public.set_conversation_expiry(
 returns timestamptz
 language plpgsql
 security definer
-set search_path = public, pg_temp
+set search_path = ''
 as $$
 declare
   v_uid uuid := auth.uid();
@@ -579,7 +592,7 @@ create or replace function public.mark_conversation_read(p_conversation_id uuid)
 returns void
 language plpgsql
 security definer
-set search_path = public, pg_temp
+set search_path = ''
 as $$
 begin
   if auth.uid() is null then
@@ -601,7 +614,7 @@ create or replace function public.burn_conversation(p_conversation_id uuid)
 returns void
 language plpgsql
 security definer
-set search_path = public, pg_temp
+set search_path = ''
 as $$
 begin
   if auth.uid() is null then
@@ -621,6 +634,10 @@ begin
 end;
 $$;
 
+-- Dropped first because server_now is a new output column; CREATE OR REPLACE
+-- cannot change the shape of an existing table function.
+drop function if exists public.list_conversations();
+
 create or replace function public.list_conversations()
 returns table (
   conversation_id uuid,
@@ -636,12 +653,13 @@ returns table (
   last_message_attachment_name text,
   last_message_sender_id uuid,
   unread_count integer,
-  partner_last_read_at timestamptz
+  partner_last_read_at timestamptz,
+  server_now timestamptz
 )
 language sql
 stable
 security definer
-set search_path = public, pg_temp
+set search_path = ''
 as $$
   select
     c.id,
@@ -663,7 +681,8 @@ as $$
         and m2.sender_id <> auth.uid()
         and m2.created_at > cm.last_read_at
     ), 0),
-    other_cm.last_read_at
+    other_cm.last_read_at,
+    now()
   from public.conversations c
   join public.conversation_members cm
     on cm.conversation_id = c.id and cm.user_id = auth.uid()
@@ -674,12 +693,15 @@ as $$
     select m.kind, m.body, m.attachment_name, m.sender_id, m.created_at
     from public.messages m
     where m.conversation_id = c.id
-    order by m.created_at desc
+    order by m.created_at desc, m.id desc
     limit 1
   ) lm on true
   where c.expires_at > now()
   order by coalesce(lm.created_at, c.created_at) desc;
 $$;
+
+-- Dropped first because server_now is a new output column.
+drop function if exists public.get_conversation(uuid);
 
 create or replace function public.get_conversation(p_conversation_id uuid)
 returns table (
@@ -689,14 +711,16 @@ returns table (
   partner_accent smallint,
   expires_at timestamptz,
   expiry_seconds integer,
-  created_at timestamptz
+  created_at timestamptz,
+  server_now timestamptz
 )
 language sql
 stable
 security definer
-set search_path = public, pg_temp
+set search_path = ''
 as $$
-  select c.id, p.id, p.username, p.accent, c.expires_at, c.expiry_seconds, c.created_at
+  select c.id, p.id, p.username, p.accent, c.expires_at, c.expiry_seconds,
+         c.created_at, now()
   from public.conversations c
   join public.conversation_members me
     on me.conversation_id = c.id and me.user_id = auth.uid()
@@ -719,12 +743,13 @@ create or replace function public.send_text_message(
 returns public.messages
 language plpgsql
 security definer
-set search_path = public, pg_temp
+set search_path = ''
 as $$
 declare
   v_uid uuid := auth.uid();
   v_body text := trim(p_body);
   v_msg public.messages;
+  v_count integer;
 begin
   if v_uid is null then
     raise exception 'not_authenticated' using errcode = '28000';
@@ -754,6 +779,14 @@ begin
 
   if found then
     return v_msg;
+  end if;
+
+  -- A single conversation must not grow without bound on the free tier.
+  select count(*) into v_count
+  from public.messages
+  where conversation_id = p_conversation_id;
+  if v_count >= 5000 then
+    raise exception 'conversation_full' using errcode = '22023';
   end if;
 
   begin
@@ -793,7 +826,7 @@ create or replace function public.send_attachment_message(
 returns public.messages
 language plpgsql
 security definer
-set search_path = public, pg_temp
+set search_path = ''
 as $$
 declare
   v_uid uuid := auth.uid();
@@ -803,6 +836,8 @@ declare
   v_data bytea;
   v_size integer;
   v_msg public.messages;
+  v_count integer;
+  v_bytes bigint;
 begin
   if v_uid is null then
     raise exception 'not_authenticated' using errcode = '28000';
@@ -832,6 +867,10 @@ begin
     raise exception 'mime_too_long' using errcode = '22023';
   end if;
 
+  if v_kind = 'file' and p_duration_ms is not null then
+    raise exception 'invalid_kind' using errcode = '22023';
+  end if;
+
   if v_kind = 'voice' and (
     p_duration_ms is null or p_duration_ms < 500 or p_duration_ms > 600000
   ) then
@@ -840,6 +879,13 @@ begin
 
   if v_kind = 'voice' and v_mime not like 'audio/%' then
     raise exception 'invalid_voice_mime' using errcode = '22023';
+  end if;
+
+  -- Reject oversized payloads before decoding. 5 MiB needs at most 7,069,056
+  -- base64 characters (ceil(bytes / 3) * 4). Without this guard a caller could
+  -- make the database allocate tens of megabytes before the byte-size check.
+  if length(p_data_base64) > 7069056 then
+    raise exception 'attachment_too_large' using errcode = '22023';
   end if;
 
   begin
@@ -862,6 +908,22 @@ begin
 
   if found then
     return v_msg;
+  end if;
+
+  -- Bound both the row count and stored payload bytes. The per-file limit is
+  -- still 5 MiB; this cap stops one long-lived chat from exhausting the project.
+  select count(*) into v_count
+  from public.messages
+  where conversation_id = p_conversation_id;
+  if v_count >= 5000 then
+    raise exception 'conversation_full' using errcode = '22023';
+  end if;
+
+  select coalesce(sum(attachment_size), 0) into v_bytes
+  from public.messages
+  where conversation_id = p_conversation_id;
+  if v_bytes + v_size > 104857600 then
+    raise exception 'conversation_storage_full' using errcode = '22023';
   end if;
 
   begin
@@ -908,7 +970,7 @@ returns table (
 language sql
 stable
 security definer
-set search_path = public, pg_temp
+set search_path = ''
 as $$
   select m.attachment_name, m.attachment_mime, m.attachment_size,
          encode(a.data, 'base64')
@@ -946,7 +1008,7 @@ returns table (
 language sql
 stable
 security definer
-set search_path = public, pg_temp
+set search_path = ''
 as $$
   select *
   from (
@@ -1000,7 +1062,7 @@ create or replace function public.purge_expired_conversations()
 returns integer
 language plpgsql
 security definer
-set search_path = public, pg_temp
+set search_path = ''
 as $$
 declare
   v_count integer;
@@ -1031,6 +1093,27 @@ $$;
 -- 9. Connection probe
 -- ---------------------------------------------------------------------------
 
+-- Supabase may report pg_cron's extension namespace as pg_catalog while the
+-- actual job table and functions live in the "cron" schema. Discover the schema
+-- by looking for the objects themselves instead of trusting extnamespace.
+create or replace function public.cron_schema_name()
+returns text
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select n.nspname
+  from pg_catalog.pg_namespace n
+  where to_regclass(format('%I.job', n.nspname)) is not null
+    and to_regprocedure(format('%I.schedule(text,text,text)', n.nspname)) is not null
+    and to_regprocedure(format('%I.unschedule(text)', n.nspname)) is not null
+  order by (n.nspname = 'cron') desc, n.nspname
+  limit 1;
+$$;
+
+revoke all on function public.cron_schema_name() from public, anon;
+
 -- Used by the app's setup screen to confirm the URL/key are correct and this
 -- SQL has been installed, before any account is created.
 create or replace function public.health_check()
@@ -1038,14 +1121,19 @@ returns jsonb
 language plpgsql
 stable
 security definer
-set search_path = public, pg_temp
+set search_path = ''
 as $$
 declare
+  v_cron_schema text;
   v_cron_ok boolean := false;
 begin
-  if to_regclass('cron.job') is not null then
-    execute 'select exists (select 1 from cron.job where jobname = $1)'
-      into v_cron_ok using 'provisional-purge-expired';
+  v_cron_schema := public.cron_schema_name();
+
+  if v_cron_schema is not null then
+    execute format(
+      'select exists (select 1 from %I.job where jobname = $1 and active)',
+      v_cron_schema
+    ) into v_cron_ok using 'provisional-purge-expired';
   end if;
 
   return jsonb_build_object(
@@ -1056,8 +1144,9 @@ begin
       and to_regclass('public.messages') is not null
       and to_regclass('public.message_attachments') is not null,
     'app', 'provisional-messenger',
-    'schema_version', 2,
-    'cron_ok', v_cron_ok
+    'schema_version', 4,
+    'cron_ok', v_cron_ok,
+    'server_now', now()
   );
 end;
 $$;
@@ -1110,6 +1199,12 @@ grant execute on function public.health_check() to anon, authenticated;
 -- 11. Realtime
 -- ---------------------------------------------------------------------------
 
+-- The client treats whole-conversation deletion as the only deletion signal.
+-- Individual message DELETE events are not relied on: with default replica
+-- identity their old rows cannot pass the member-only RLS policy, and setting
+-- REPLICA IDENTITY FULL would expose message bodies in Realtime payloads.
+-- The conversation_deletions tombstone below carries the chat-level signal.
+
 do $$
 begin
   begin
@@ -1160,6 +1255,9 @@ $$;
 -- ---------------------------------------------------------------------------
 
 do $$
+declare
+  v_cron_schema text;
+  v_job_exists boolean := false;
 begin
   begin
     create extension if not exists pg_cron;
@@ -1168,16 +1266,26 @@ begin
       raise notice 'pg_cron could not be enabled. Enable it under Database -> Extensions, then re-run section 12.';
   end;
 
-  if exists (select 1 from pg_extension where extname = 'pg_cron') then
-    if exists (select 1 from cron.job where jobname = 'provisional-purge-expired') then
-      perform cron.unschedule('provisional-purge-expired');
+  v_cron_schema := public.cron_schema_name();
+
+  if v_cron_schema is not null then
+    execute format(
+      'select exists (select 1 from %I.job where jobname = $1)',
+      v_cron_schema
+    ) into v_job_exists using 'provisional-purge-expired';
+
+    if v_job_exists then
+      execute format('select %I.unschedule($1)', v_cron_schema)
+        using 'provisional-purge-expired';
     end if;
 
-    perform cron.schedule(
-      'provisional-purge-expired',
-      '* * * * *',
-      'select public.purge_expired_conversations();'
-    );
+    execute format('select %I.schedule($1, $2, $3)', v_cron_schema)
+      using
+        'provisional-purge-expired',
+        '* * * * *',
+        'select public.purge_expired_conversations();';
+  else
+    raise notice 'pg_cron is not installed. Enable it under Database -> Extensions, then re-run section 12.';
   end if;
 end;
 $$;

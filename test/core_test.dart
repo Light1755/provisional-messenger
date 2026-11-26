@@ -2,6 +2,7 @@ import 'dart:convert';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:provisional_messenger/core/format.dart';
+import 'package:provisional_messenger/core/server_clock.dart';
 import 'package:provisional_messenger/core/supabase_key.dart';
 import 'package:provisional_messenger/core/username.dart';
 
@@ -44,6 +45,30 @@ void main() {
       expect(usernameLooksValid('ab'), isFalse);
       expect(usernameLooksValid('has space'), isFalse);
       expect(usernameLooksValid('admin'), isFalse);
+    });
+  });
+
+  group('server clock', () {
+    test('adopts the server offset and advances with local time', () {
+      var local = DateTime.utc(2026, 11, 26, 6);
+      final clock = ServerClock(localNow: () => local);
+
+      clock.observe(DateTime.utc(2026, 11, 26, 8));
+      expect(clock.hasSample, isTrue);
+      expect(clock.nowUtc(), DateTime.utc(2026, 11, 26, 8));
+
+      local = local.add(const Duration(minutes: 3));
+      expect(clock.nowUtc(), DateTime.utc(2026, 11, 26, 8, 3));
+    });
+
+    test('reset removes the learned offset', () {
+      var local = DateTime.utc(2026, 11, 26, 6);
+      final clock = ServerClock(localNow: () => local);
+      clock.observe(DateTime.utc(2026, 11, 26, 8));
+
+      clock.reset();
+      expect(clock.hasSample, isFalse);
+      expect(clock.nowUtc(), local);
     });
   });
 

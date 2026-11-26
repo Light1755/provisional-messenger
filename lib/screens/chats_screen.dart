@@ -5,6 +5,7 @@ import 'package:provider/provider.dart';
 
 import '../core/format.dart';
 import '../core/routes.dart';
+import '../core/server_clock.dart';
 import '../core/theme.dart';
 import '../data/models.dart';
 import '../state/app_state.dart';
@@ -44,12 +45,15 @@ class _ChatsScreenState extends State<ChatsScreen> {
   }
 
   Future<void> _openConversation(ConversationSummary conversation) async {
-    await Navigator.of(context).push(
-      appPageRoute<void>(
+    final burned = await Navigator.of(context).push<bool>(
+      appPageRoute<bool>(
         ConversationScreen(conversationId: conversation.id),
       ),
     );
     if (!mounted) return;
+    if (burned == true) {
+      showAppSnack(context, 'Conversation burned for both people.');
+    }
     context.read<AppState>().refreshConversations(silent: true);
   }
 
@@ -58,7 +62,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
     final app = context.watch<AppState>();
     final scheme = Theme.of(context).colorScheme;
     final active = app.conversations
-        .where((c) => c.expiresAt.isAfter(DateTime.now()))
+        .where((c) => c.expiresAt.isAfter(serverClock.now()))
         .toList(growable: false);
     final unread = active.fold<int>(0, (sum, c) => sum + c.unreadCount);
 
@@ -138,7 +142,7 @@ class _ChatsScreenState extends State<ChatsScreen> {
                   const SizedBox(width: 8),
                   Expanded(
                     child: Text(
-                      'Offline. Showing the last known chats.',
+                      'Refresh failed. Showing the last known chats.',
                       style: TextStyle(
                         fontSize: 11.5,
                         color: scheme.onSurface.withValues(alpha: .55),

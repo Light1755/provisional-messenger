@@ -1,5 +1,7 @@
 import 'package:intl/intl.dart';
 
+import 'server_clock.dart';
+
 String formatDuration(int milliseconds) {
   final total = (milliseconds / 1000).round().clamp(0, 359999);
   final hours = total ~/ 3600;
@@ -19,7 +21,7 @@ String formatBytes(int bytes) {
 }
 
 String formatChatListTime(DateTime date) {
-  final now = DateTime.now();
+  final now = serverClock.now();
   final local = date.toLocal();
   final today = DateTime(now.year, now.month, now.day);
   final day = DateTime(local.year, local.month, local.day);
@@ -34,7 +36,7 @@ String formatMessageTime(DateTime date) =>
     DateFormat.jm().format(date.toLocal());
 
 String formatDateHeader(DateTime date) {
-  final now = DateTime.now();
+  final now = serverClock.now();
   final local = date.toLocal();
   final today = DateTime(now.year, now.month, now.day);
   final day = DateTime(local.year, local.month, local.day);
@@ -92,7 +94,7 @@ String expiryShortLabel(int seconds) {
 
 String formatExpiryDate(DateTime date) {
   final local = date.toLocal();
-  final now = DateTime.now();
+  final now = serverClock.now();
   if (local.year == now.year &&
       local.month == now.month &&
       local.day == now.day) {

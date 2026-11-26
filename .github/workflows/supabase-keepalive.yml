@@ -11,23 +11,41 @@ permissions:
 
 jobs:
   ping:
+    name: Check Supabase health
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # Fallbacks are the public publishable values for this project, not secrets.
+      SUPABASE_URL: ${{ vars.SUPABASE_URL || secrets.SUPABASE_URL || 'https://cjcfppidlsezrvzerikf.supabase.co' }}
+      SUPABASE_ANON_KEY: ${{ vars.SUPABASE_ANON_KEY || secrets.SUPABASE_ANON_KEY || 'sb_publishable_DQ9wglms3K1hg3CiU_MMRA__5uEdw6U' }}
     steps:
       - name: Ping health check
-        env:
-          SUPABASE_URL: ${{ vars.SUPABASE_URL || secrets.SUPABASE_URL }}
-          SUPABASE_ANON_KEY: ${{ vars.SUPABASE_ANON_KEY || secrets.SUPABASE_ANON_KEY }}
         run: |
-          if [ -z "$SUPABASE_URL" ] || [ -z "$SUPABASE_ANON_KEY" ]; then
-            echo "::error::Set SUPABASE_URL and SUPABASE_ANON_KEY as repository Actions variables (or secrets)."
-            exit 1
-          fi
-
+          set -euo pipefail
           url="${SUPABASE_URL%/}/rest/v1/rpc/health_check"
           response="$(curl --fail --silent --show-error --max-time 30 \
             -H "apikey: $SUPABASE_ANON_KEY" \
             -H "Authorization: Bearer $SUPABASE_ANON_KEY" \
             "$url")"
 
-          echo "$response"
-          echo "$response" | jq -e '.ok == true' > /dev/null
+          printf '%s\n' "$response" | jq -e 'type == "object"' > /dev/null || {
+            echo "::error::health_check did not return a JSON object"
+            exit 1
+          }
+
+          check_field() {
+            field="$1"
+            expected="$2"
+            actual="$(printf '%s\n' "$response" | jq -r --arg f "$field" '.[$f] // empty')"
+            if [ "$actual" != "$expected" ]; then
+              echo "::error::health_check $field is '$actual' (expected '$expected')"
+              exit 1
+            fi
+          }
+
+          # Any mismatch (including a missing field) fails the workflow.
+          check_field ok true
+          check_field cron_ok true
+          check_field schema_version 4
+
+          printf '%s\n' "$response" | jq -c '{ok, cron_ok, schema_version, app}'

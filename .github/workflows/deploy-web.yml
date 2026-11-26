@@ -14,12 +14,57 @@ concurrency:
   group: pages
   cancel-in-progress: true
 
+env:
+  EXPECTED_SUPABASE_URL: https://cjcfppidlsezrvzerikf.supabase.co
+
 jobs:
   build:
+    name: Build web
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      SUPABASE_URL: ${{ vars.SUPABASE_URL || secrets.SUPABASE_URL || '' }}
+      SUPABASE_ANON_KEY: ${{ vars.SUPABASE_ANON_KEY || secrets.SUPABASE_ANON_KEY || vars.SUPABASE_KEY || secrets.SUPABASE_KEY || '' }}
     steps:
       - name: Check out
         uses: actions/checkout@v4
+
+      - name: Validate baked Supabase config
+        run: |
+          set -euo pipefail
+          if [ -z "${SUPABASE_URL:-}" ]; then
+            echo "::error::SUPABASE_URL is empty. Set it as an Actions variable or secret."
+            exit 1
+          fi
+          if [ "$SUPABASE_URL" != "$EXPECTED_SUPABASE_URL" ]; then
+            echo "::error::SUPABASE_URL does not match the expected project URL."
+            exit 1
+          fi
+          if [ -z "${SUPABASE_ANON_KEY:-}" ]; then
+            echo "::error::SUPABASE_ANON_KEY is empty. Set it as an Actions variable or secret."
+            exit 1
+          fi
+          case "$SUPABASE_ANON_KEY" in
+            sb_publishable_*) ;;
+            *)
+              # Legacy anon JWT: three base64url segments with role=anon.
+              if ! printf '%s' "$SUPABASE_ANON_KEY" | grep -Eq '^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$'; then
+                echo "::error::SUPABASE_ANON_KEY must start with sb_publishable_ or be a valid anon JWT."
+                exit 1
+              fi
+              payload="$(printf '%s' "$SUPABASE_ANON_KEY" | cut -d. -f2 | tr '_-' '/+')"
+              case $((${#payload} % 4)) in
+                2) payload="${payload}==" ;;
+                3) payload="${payload}=" ;;
+              esac
+              role="$(printf '%s' "$payload" | base64 -d 2>/dev/null | jq -r '.role // empty' || true)"
+              if [ "$role" != "anon" ]; then
+                echo "::error::SUPABASE_ANON_KEY JWT must have role=anon."
+                exit 1
+              fi
+              ;;
+          esac
+          echo "Supabase URL and key shape validated; values not logged."
 
       - name: Install Flutter
         uses: subosito/flutter-action@v2
@@ -28,41 +73,65 @@ jobs:
           channel: stable
           cache: true
 
-      - name: Check Supabase configuration
-        env:
-          SUPABASE_URL: ${{ vars.SUPABASE_URL || secrets.SUPABASE_URL }}
-          SUPABASE_ANON_KEY: ${{ vars.SUPABASE_ANON_KEY || secrets.SUPABASE_ANON_KEY }}
-        run: |
-          if [ -z "$SUPABASE_URL" ] || [ -z "$SUPABASE_ANON_KEY" ]; then
-            echo "::error::Set SUPABASE_URL and SUPABASE_ANON_KEY as repository Actions variables (or secrets)."
-            exit 1
-          fi
-          echo "SUPABASE_URL=$SUPABASE_URL" >> "$GITHUB_ENV"
-          echo "SUPABASE_ANON_KEY=$SUPABASE_ANON_KEY" >> "$GITHUB_ENV"
-
       - name: Install packages
         run: flutter pub get
 
       - name: Compute base href
         id: base
         env:
-          REPO_NAME: ${{ github.event.repository.name }}
-          BASE_HREF: ${{ vars.PAGES_BASE_HREF }}
+          PAGES_BASE_HREF: ${{ vars.PAGES_BASE_HREF || '' }}
         run: |
-          if [ -n "$BASE_HREF" ]; then
-            echo "href=$BASE_HREF" >> "$GITHUB_OUTPUT"
-          elif [[ "$REPO_NAME" == *.github.io ]]; then
-            echo "href=/" >> "$GITHUB_OUTPUT"
-          else
-            echo "href=/$REPO_NAME/" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          repo="${GITHUB_REPOSITORY#*/}"
+          if [ -z "$repo" ]; then
+            echo "::error::Could not derive repository name from GITHUB_REPOSITORY."
+            exit 1
           fi
+          case "$repo" in
+            *.github.io) href='/' ;;
+            *) href="/$repo/" ;;
+          esac
+          if [ -n "$PAGES_BASE_HREF" ]; then
+            href="$PAGES_BASE_HREF"
+          fi
+          case "$href" in
+            /*/) ;;
+            *) echo "::error::Base href must start and end with '/': $href"; exit 1 ;;
+          esac
+          echo "href=$href" >> "$GITHUB_OUTPUT"
+          echo "Base href: $href"
 
       - name: Build web
+        env:
+          BASE_HREF: ${{ steps.base.outputs.href }}
         run: |
+          set -euo pipefail
           flutter build web --release \
-            --base-href "${{ steps.base.outputs.href }}" \
+            --base-href "$BASE_HREF" \
             --dart-define=SUPABASE_URL="$SUPABASE_URL" \
             --dart-define=SUPABASE_ANON_KEY="$SUPABASE_ANON_KEY"
+
+      - name: Verify web output
+        env:
+          BASE_HREF: ${{ steps.base.outputs.href }}
+        run: |
+          set -euo pipefail
+          test -d build/web || { echo "::error::build/web is missing"; exit 1; }
+          test -s build/web/main.dart.js || { echo "::error::main.dart.js is missing or empty"; exit 1; }
+          test -s build/web/index.html || { echo "::error::index.html is missing or empty"; exit 1; }
+          grep -Fq "$BASE_HREF" build/web/index.html || { echo "::error::index.html does not contain the expected base href"; exit 1; }
+          file_count="$(find build/web -type f | wc -l)"
+          if [ "$file_count" -lt 5 ]; then
+            echo "::error::build/web has too few files: $file_count"
+            exit 1
+          fi
+          total_bytes="$(find build/web -type f -printf '%s\n' | awk '{sum += $1} END {print sum + 0}')"
+          if [ "$total_bytes" -lt 100000 ]; then
+            echo "::error::build/web is too small: $total_bytes bytes"
+            exit 1
+          fi
+          echo "Web output: $file_count files, $total_bytes bytes, base $BASE_HREF"
+          sha256sum build/web/main.dart.js
 
       - name: Configure Pages
         uses: actions/configure-pages@v5
@@ -73,8 +142,10 @@ jobs:
           path: build/web
 
   deploy:
+    name: Deploy to Pages
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

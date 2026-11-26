@@ -3,7 +3,7 @@
 Provisional is a two-person messenger built around deletion. You create a username, start a chat, choose a timer, and either person can burn the chat at any time. There is no email, phone number, password, demo account, or seeded conversation.
 
 - Web app: https://light1755.github.io/provisional-messenger/
-- Android release: https://github.com/Light1755/provisional-messenger/releases/tag/v1.0.1
+- Android release: https://github.com/Light1755/provisional-messenger/releases/tag/v1.0.2
 
 The client is Flutter. The server is Supabase: Postgres, anonymous auth, Realtime, and a scheduled cleanup job. `supabase/setup.sql` installs the whole server side in one run.
 
@@ -75,7 +75,7 @@ from cron.job
 where jobname = 'provisional-purge-expired';
 ```
 
-6. Optional: run `select public.health_check();` in the SQL Editor. It should return `"ok": true` and `"cron_ok": true`.
+6. Optional: run `select public.health_check();` in the SQL Editor. It should return `"ok": true`, `"cron_ok": true`, and `"schema_version": 4`. The keep-alive workflow checks all three.
 
 ### 2. Run the client
 
@@ -115,24 +115,40 @@ Wait for the minute job, then refresh both clients.
 
 ## Build for sharing
 
-Web build:
+Current release: 1.0.2 (build 3). CI rejects empty or wrong `SUPABASE_URL` and key values before building.
+
+Web build for the live project page:
 
 ```bash
 flutter build web --release \
-  --base-href="/" \
+  --base-href="/provisional-messenger/" \
   --dart-define=SUPABASE_URL=https://YOUR-PROJECT.supabase.co \
   --dart-define=SUPABASE_ANON_KEY=YOUR_ANON_OR_PUBLISHABLE_KEY
 ```
 
-Android APK:
+A domain-root deployment uses `--base-href="/"` instead. The deploy workflow derives the value from the repository name.
+
+Android builds:
 
 ```bash
 flutter build apk --release \
   --dart-define=SUPABASE_URL=https://YOUR-PROJECT.supabase.co \
   --dart-define=SUPABASE_ANON_KEY=YOUR_ANON_OR_PUBLISHABLE_KEY
+flutter build appbundle --release \
+  --dart-define=SUPABASE_URL=https://YOUR-PROJECT.supabase.co \
+  --dart-define=SUPABASE_ANON_KEY=YOUR_ANON_OR_PUBLISHABLE_KEY
 ```
 
-Release builds are signed with the keystore described in `docs/DEPLOYMENT.md`. The application id is `com.light1755.provisionalmessenger`; keep the same signing key for future updates.
+Rename the outputs for release uploads:
+
+```bash
+cp build/app/outputs/flutter-apk/app-release.apk provisional-messenger-v1.0.2.apk
+cp build/app/outputs/bundle/release/app-release.aab provisional-messenger-v1.0.2.aab
+```
+
+Release builds need the signing values from `android/key.properties` or the `KEY_*`/`KEYSTORE_*` environment variables in `docs/DEPLOYMENT.md`. Gradle fails with a clear error when they are missing; debug builds do not need them. The application id is `com.light1755.provisionalmessenger`; keep the same signing key for future updates.
+
+Publishing a GitHub Release requires browser authentication, or a fine-grained PAT with `Contents` and `Releases` write access for API/CLI use.
 
 [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) has the GitHub Pages setup, the APK signing steps, and the keep-alive details.
 
@@ -186,12 +202,12 @@ supabase/
 | Messages send but do not arrive live | Check Realtime is enabled and the four tables are in the `supabase_realtime` publication |
 | Setup screen rejects the key | Use the anon public key or `sb_publishable_` key, not a server key |
 | Free project is paused | Restore it in the Supabase dashboard, then run the keep-alive workflow manually |
-| Old web build keeps loading | Hard refresh, or clear the site data to remove the service worker cache |
+| Old web build keeps loading | Hard reload (Ctrl/Cmd+Shift+R) after a deploy; this app registers no custom service worker beyond Flutter's default |
 
 ## Tests
 
 ```bash
-flutter analyze
+flutter analyze --fatal-infos
 flutter test
 ```
 

@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../core/env.dart';
+import '../core/server_clock.dart';
 import 'models.dart';
 
 class ApiException implements Exception {
@@ -52,7 +53,13 @@ class Api {
       });
 
   Future<void> burnProfile() => _guard(() async {
-        await _c.rpc('burn_profile').timeout(_writeTimeout);
+        final res = await _c.rpc('burn_profile').timeout(_writeTimeout);
+        if (!burnResultSucceeded(res)) {
+          throw ApiException(
+            'The profile could not be burned. Try again.',
+            code: 'burn_incomplete',
+          );
+        }
       });
 
   Future<List<SearchResult>> searchProfiles(String query) => _guard(() async {
@@ -63,7 +70,9 @@ class Api {
 
   Future<List<ConversationSummary>> listConversations() => _guard(() async {
         final res = await _c.rpc('list_conversations').timeout(_readTimeout);
-        return _rows(res)
+        final rows = _rows(res);
+        _observeServerTime(rows);
+        return rows
             .map(ConversationSummary.fromJson)
             .toList(growable: false);
       });
@@ -75,6 +84,7 @@ class Api {
           params: {'p_conversation_id': conversationId},
         ).timeout(_readTimeout);
         final map = _firstMap(res);
+        if (map != null) _observeServerTime([map]);
         return map == null ? null : ConversationDetail.fromJson(map);
       });
 
@@ -257,6 +267,8 @@ class Api {
           'supabase/setup.sql again.',
         );
       }
+      final serverNow = DateTime.tryParse(map['server_now']?.toString() ?? '');
+      if (serverNow != null) serverClock.observe(serverNow);
     } on PostgrestException catch (e) {
       if (e.code == 'PGRST202' ||
           e.message.toLowerCase().contains('health_check')) {
@@ -405,9 +417,9 @@ class Api {
     }
     if (lower.contains('not_authenticated')) {
       return ApiException(
-        'Your session ended. Reopen the app and try again.',
+        'Your session ended. Tap Retry to reconnect.',
         raw: raw,
-        code: e.code,
+        code: 'session_expired',
       );
     }
     if (lower.contains('conversation_not_found')) {
@@ -453,6 +465,15 @@ class Api {
         code: e.code,
       );
     }
+    if (lower.contains('conversation_full') ||
+        lower.contains('conversation_storage_full')) {
+      return ApiException(
+        'This chat has reached its message or storage limit. '
+        'Start a new conversation.',
+        raw: raw,
+        code: 'conversation_full',
+      );
+    }
     if (lower.contains('empty_message')) {
       return ApiException('Type a message first.');
     }
@@ -461,9 +482,9 @@ class Api {
     }
     if (e.code == 'PGRST301' || e.code == '401') {
       return ApiException(
-        'Your session is no longer valid. Reopen the app and try again.',
+        'Your session is no longer valid. Tap Retry to reconnect.',
         raw: raw,
-        code: e.code,
+        code: 'session_expired',
       );
     }
     return ApiException(
@@ -490,6 +511,18 @@ class Api {
         raw: e.message,
       );
     }
+    if (lower.contains('user not found') ||
+        lower.contains('user_not_found') ||
+        lower.contains('session not found') ||
+        lower.contains('session_not_found') ||
+        lower.contains('auth session missing') ||
+        lower.contains('refresh token')) {
+      return ApiException(
+        'Your session ended. Tap Retry to reconnect.',
+        code: 'session_expired',
+        raw: e.message,
+      );
+    }
     return ApiException(
       e.message.isEmpty ? 'Authentication failed.' : e.message,
       code: e.code,
@@ -502,6 +535,45 @@ class Api {
 
   @visibleForTesting
   static List<Map<String, dynamic>> rows(dynamic value) => _rows(value);
+
+  /// Older servers returned void; a null/absent result is still a successful
+  /// burn. An explicit `content_deleted: false` is the only failure result.
+  @visibleForTesting
+  static bool burnResultSucceeded(dynamic value) {
+    final map = _firstMap(value);
+    return map == null || map['content_deleted'] != false;
+  }
+
+  /// Definite session failures only. Network timeouts, permission errors, and
+  /// generic `not_authenticated` responses must not cause a valid local session
+  /// (and its profile) to be discarded during a transient refresh failure.
+  static bool isDefiniteSessionError(ApiException e) {
+    const codes = {'orphan_session', '401', 'PGRST301'};
+    if (codes.contains(e.code)) return true;
+    final raw = e.raw?.toLowerCase() ?? '';
+    const signatures = [
+      'user_not_found',
+      'user not found',
+      'session_not_found',
+      'session not found',
+      'auth session missing',
+      'jwt expired',
+      'refresh token',
+    ];
+    return signatures.any(raw.contains);
+  }
+
+  static void _observeServerTime(Iterable<Map<String, dynamic>> rows) {
+    for (final row in rows) {
+      final raw = row['server_now'];
+      if (raw == null) continue;
+      final parsed = raw is DateTime ? raw : DateTime.tryParse(raw.toString());
+      if (parsed != null) {
+        serverClock.observe(parsed);
+        return;
+      }
+    }
+  }
 
   static Map<String, dynamic>? _firstMap(dynamic value) {
     if (value == null) return null;

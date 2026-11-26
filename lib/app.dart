@@ -67,6 +67,12 @@ class _ProvisionalAppState extends State<ProvisionalApp> {
     }
   }
 
+  Future<void> _disposeSupabase() async {
+    if (Supabase.instance.isInitialized) {
+      await Supabase.instance.dispose();
+    }
+  }
+
   Future<AppState> _openClient(String url, String key) async {
     if (isServerOnlySupabaseKey(key)) {
       throw ApiException(
@@ -75,16 +81,28 @@ class _ProvisionalAppState extends State<ProvisionalApp> {
         'Rebuild with the anon public key or an sb_publishable_ key.',
       );
     }
-    await Supabase.initialize(
-      url: url,
-      publishableKey: key,
-      authOptions: const FlutterAuthClientOptions(autoRefreshToken: true),
-    );
-    return AppState(
-      client: Supabase.instance.client,
-      prefs: widget.prefs,
-      themeMode: _themeMode,
-    );
+    try {
+      // A failed initialize can leave the singleton half-initialized. Clear it
+      // before retrying so Retry is a real retry instead of a dead end.
+      await _disposeSupabase();
+      await Supabase.initialize(
+        url: url,
+        publishableKey: key,
+        authOptions: const FlutterAuthClientOptions(autoRefreshToken: true),
+      );
+      return AppState(
+        client: Supabase.instance.client,
+        prefs: widget.prefs,
+        themeMode: _themeMode,
+      );
+    } catch (e) {
+      try {
+        await _disposeSupabase();
+      } catch (_) {
+        // Preserve the original connection error.
+      }
+      rethrow;
+    }
   }
 
   Future<void> _connectBoot() async {

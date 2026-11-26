@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 
 import '../core/format.dart';
+import '../core/server_clock.dart';
 import '../core/theme.dart';
 
 /// Rebuilds its child every second with the time left until [expiresAt].
@@ -54,7 +55,7 @@ class _CountdownBuilderState extends State<CountdownBuilder> {
 
   void _checkExpired() {
     if (!mounted || _reportedExpired) return;
-    if (!DateTime.now().isBefore(widget.expiresAt)) {
+    if (!serverClock.now().isBefore(widget.expiresAt)) {
       _reportedExpired = true;
       widget.onExpired?.call();
     }
@@ -68,7 +69,7 @@ class _CountdownBuilderState extends State<CountdownBuilder> {
 
   @override
   Widget build(BuildContext context) {
-    final remaining = widget.expiresAt.difference(DateTime.now());
+    final remaining = widget.expiresAt.difference(serverClock.now());
     return widget.builder(
       context,
       remaining.isNegative ? Duration.zero : remaining,

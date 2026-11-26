@@ -133,29 +133,31 @@ class _DiscoverScreenState extends State<DiscoverScreen> {
   Future<void> _choose(SearchResult result) async {
     if (_busyId != null) return;
     FocusScope.of(context).unfocus();
-    final app = context.read<AppState>();
-    final existing = _existingWith(result.id);
-
-    if (existing != null) {
-      await _openChat(existing.id, result.username, result.accent);
-      return;
-    }
-
-    final seconds = await showExpiryPicker(
-      context,
-      selectedSeconds: Env.defaultExpirySeconds,
-      title: 'How long should this chat last?',
-      description:
-          'Choose before the first message. Either person can change it later '
-          'in chat settings. If you already have a live chat, that one opens '
-          'instead.',
-      confirmLabel: 'Start private chat',
-      highlightDefault: true,
-    );
-    if (seconds == null || !mounted) return;
-
+    // Claim the row before awaiting the expiry picker. Otherwise two quick taps
+    // can both reach startConversation and create duplicate chats.
     setState(() => _busyId = result.id);
     try {
+      final app = context.read<AppState>();
+      final existing = _existingWith(result.id);
+
+      if (existing != null) {
+        await _openChat(existing.id, result.username, result.accent);
+        return;
+      }
+
+      final seconds = await showExpiryPicker(
+        context,
+        selectedSeconds: Env.defaultExpirySeconds,
+        title: 'How long should this chat last?',
+        description:
+            'Choose before the first message. Either person can change it later '
+            'in chat settings. If you already have a live chat, that one opens '
+            'instead.',
+        confirmLabel: 'Start private chat',
+        highlightDefault: true,
+      );
+      if (seconds == null || !mounted) return;
+
       final id = await app.startConversation(
         result.id,
         expirySeconds: seconds,
@@ -178,8 +180,8 @@ class _DiscoverScreenState extends State<DiscoverScreen> {
   }
 
   Future<void> _openChat(String id, String username, int accent) async {
-    await Navigator.of(context).push(
-      appPageRoute<void>(
+    final burned = await Navigator.of(context).push<bool>(
+      appPageRoute<bool>(
         ConversationScreen(
           conversationId: id,
           partnerUsername: username,
@@ -188,6 +190,9 @@ class _DiscoverScreenState extends State<DiscoverScreen> {
       ),
     );
     if (!mounted) return;
+    if (burned == true) {
+      showAppSnack(context, 'Conversation burned for both people.');
+    }
     unawaited(context.read<AppState>().refreshConversations(silent: true));
   }
 

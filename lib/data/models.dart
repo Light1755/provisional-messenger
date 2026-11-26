@@ -1,5 +1,7 @@
 import 'dart:typed_data';
 
+import '../core/server_clock.dart';
+
 enum MessageKind {
   text,
   file,
@@ -91,9 +93,9 @@ class ConversationSummary {
   final int unreadCount;
   final DateTime? partnerLastReadAt;
 
-  bool get isExpired => !DateTime.now().isBefore(expiresAt);
+  bool get isExpired => !serverClock.now().isBefore(expiresAt);
 
-  Duration get remaining => expiresAt.difference(DateTime.now());
+  Duration get remaining => expiresAt.difference(serverClock.now());
 
   DateTime get sortTime => lastMessageAt ?? createdAt;
 
@@ -179,9 +181,9 @@ class ConversationDetail {
   final int expirySeconds;
   final DateTime createdAt;
 
-  bool get isExpired => !DateTime.now().isBefore(expiresAt);
+  bool get isExpired => !serverClock.now().isBefore(expiresAt);
 
-  Duration get remaining => expiresAt.difference(DateTime.now());
+  Duration get remaining => expiresAt.difference(serverClock.now());
 
   factory ConversationDetail.fromJson(Map<String, dynamic> json) =>
       ConversationDetail(

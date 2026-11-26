@@ -14,6 +14,7 @@ import 'package:uuid/uuid.dart';
 import '../core/env.dart';
 import '../core/format.dart';
 import '../core/routes.dart';
+import '../core/server_clock.dart';
 import '../core/theme.dart';
 import '../data/api.dart';
 import '../data/models.dart';
@@ -77,6 +78,7 @@ class _ConversationScreenState extends State<ConversationScreen>
   Uri? _audioUri;
 
   bool _recording = false;
+  bool _recordingStarting = false;
   DateTime? _recordStartedAt;
   Duration _recordElapsed = Duration.zero;
   Timer? _recordTimer;
@@ -93,6 +95,9 @@ class _ConversationScreenState extends State<ConversationScreen>
 
   StreamSubscription<PlayerState>? _playerStateSub;
   StreamSubscription<Duration>? _positionSub;
+  int _audioRequest = 0;
+  bool _audioBusy = false;
+  bool _foreground = true;
 
   @override
   void initState() {
@@ -116,7 +121,9 @@ class _ConversationScreenState extends State<ConversationScreen>
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed && !_ended && mounted) {
+    _foreground = state == AppLifecycleState.resumed;
+    if (_foreground && !_ended && mounted) {
+      if (_pendingRead) _markReadSoon();
       unawaited(_poll());
     }
   }
@@ -124,6 +131,7 @@ class _ConversationScreenState extends State<ConversationScreen>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _audioRequest++;
     _cleanupLive();
     _recordTimer?.cancel();
     _playerStateSub?.cancel();
@@ -296,7 +304,7 @@ class _ConversationScreenState extends State<ConversationScreen>
       if (detail == null) {
         final known = _detail;
         _end(
-          known != null && !known.expiresAt.isAfter(DateTime.now())
+          known != null && !known.expiresAt.isAfter(serverClock.now())
               ? _EndReason.expired
               : _EndReason.closed,
         );
@@ -318,7 +326,7 @@ class _ConversationScreenState extends State<ConversationScreen>
   }
 
   Future<void> _fetchMessages({bool initial = false}) async {
-    final started = DateTime.now();
+    final started = serverClock.now();
     final request = ++_messageRequest;
     try {
       final list = await _app.api.getMessages(_conversationId);
@@ -380,18 +388,10 @@ class _ConversationScreenState extends State<ConversationScreen>
         _scrollToBottom();
       }
 
-      ChatMessage? latestPartner;
-      for (final message in merged) {
-        if (message.isMine || message.status != MessageStatus.sent) continue;
-        if (latestPartner == null ||
-            message.createdAt.isAfter(latestPartner.createdAt)) {
-          latestPartner = message;
-        }
-      }
+      final latestPartner = _latestPartnerAt(merged);
       if (latestPartner != null) {
-        _requestRead(latestPartner.createdAt);
+        _requestRead(latestPartner);
       }
-      if (_pendingRead) _markReadSoon();
     } catch (e) {
       if (!mounted || request != _messageRequest) return;
       if (initial) {
@@ -505,7 +505,6 @@ class _ConversationScreenState extends State<ConversationScreen>
     });
     if (nearBottom) _scrollToBottom();
     _requestRead(message.createdAt);
-    _markReadSoon();
     HapticFeedback.lightImpact();
   }
 
@@ -515,7 +514,7 @@ class _ConversationScreenState extends State<ConversationScreen>
     if (expiresRaw == null) return;
     final expiresAt = DateTime.tryParse(expiresRaw.toString())?.toLocal();
     if (expiresAt == null) return;
-    if (!expiresAt.isAfter(DateTime.now())) {
+    if (!expiresAt.isAfter(serverClock.now())) {
       _end(_EndReason.expired);
       return;
     }
@@ -538,7 +537,7 @@ class _ConversationScreenState extends State<ConversationScreen>
   void _handleConversationGone() {
     if (!mounted || _ended) return;
     final detail = _detail;
-    if (detail != null && !detail.expiresAt.isAfter(DateTime.now())) {
+    if (detail != null && !detail.expiresAt.isAfter(serverClock.now())) {
       _end(_EndReason.expired);
     } else {
       _end(_EndReason.closed);
@@ -554,11 +553,12 @@ class _ConversationScreenState extends State<ConversationScreen>
     // leaving a burned or expired chat so no note is sent into a deleted row.
     _recordTimer?.cancel();
     _recordTimer = null;
-    if (_recording) {
+    if (_recording || _recordingStarting || _recorder.isStarting) {
       _recording = false;
+      _recordingStarting = false;
       _recordStartedAt = null;
       _recordElapsed = Duration.zero;
-      unawaited(_recorder.stop(cancel: true));
+      unawaited(_recorder.cancel());
     }
     _pendingRead = false;
     unawaited(_stopPlayback());
@@ -569,22 +569,27 @@ class _ConversationScreenState extends State<ConversationScreen>
   }
 
   void _requestRead(DateTime through) {
-    if (_lastReadThrough == null || through.isAfter(_lastReadThrough!)) {
-      _lastReadThrough = through;
-    }
-    // Keep the flag set until the server confirms the receipt.
+    // A receipt means the user actually saw the message. Do not write one for
+    // messages scrolled out of view, while the app is backgrounded, or again on
+    // every poll for a timestamp already confirmed by the server.
+    if (_ended || !_foreground || !_isNearBottom) return;
+    if (_lastReadThrough != null && !through.isAfter(_lastReadThrough!)) return;
+    _lastReadThrough = through;
     _pendingRead = true;
+    _markReadSoon();
   }
 
   void _markReadSoon({Duration delay = const Duration(milliseconds: 350)}) {
     _readDebounce?.cancel();
     _readDebounce = Timer(delay, () {
-      if (mounted && !_ended && _pendingRead) unawaited(_flushRead());
+      if (mounted && !_ended && _foreground && _pendingRead) {
+        unawaited(_flushRead());
+      }
     });
   }
 
   Future<void> _flushRead() async {
-    if (_readInFlight || !_pendingRead || _ended) return;
+    if (_readInFlight || !_pendingRead || _ended || !_foreground) return;
     _readInFlight = true;
     try {
       final confirmed = await _app.markRead(_conversationId);
@@ -604,11 +609,29 @@ class _ConversationScreenState extends State<ConversationScreen>
     return _scroll.position.maxScrollExtent - _scroll.position.pixels < 180;
   }
 
+  DateTime? _latestPartnerAt([List<ChatMessage>? messages]) {
+    DateTime? latest;
+    for (final message in messages ?? _messages) {
+      if (message.isMine || message.status != MessageStatus.sent) continue;
+      if (latest == null || message.createdAt.isAfter(latest)) {
+        latest = message.createdAt;
+      }
+    }
+    return latest;
+  }
+
   void _onScroll() {
-    final show =
-        _scroll.hasClients &&
-        _scroll.position.maxScrollExtent - _scroll.position.pixels > 280;
+    final distanceFromBottom = _scroll.hasClients
+        ? _scroll.position.maxScrollExtent - _scroll.position.pixels
+        : 0.0;
+    final show = distanceFromBottom > 280;
     if (show != _showJump) setState(() => _showJump = show);
+    // Scrolling back to the bottom makes the messages visible again, so send
+    // the receipt now instead of waiting for the next poll or new message.
+    if (distanceFromBottom < 180) {
+      final latest = _latestPartnerAt();
+      if (latest != null) _requestRead(latest);
+    }
   }
 
   void _scrollToBottom({bool animate = true}) {
@@ -654,7 +677,7 @@ class _ConversationScreenState extends State<ConversationScreen>
       kind: MessageKind.text,
       body: text,
       clientId: clientId,
-      createdAt: DateTime.now(),
+      createdAt: serverClock.now(),
       isMine: true,
       status: MessageStatus.sending,
     );
@@ -814,7 +837,7 @@ class _ConversationScreenState extends State<ConversationScreen>
       attachmentSize: bytes.length,
       durationMs: durationMs,
       clientId: clientId,
-      createdAt: DateTime.now(),
+      createdAt: serverClock.now(),
       isMine: true,
       status: MessageStatus.sending,
       localBytes: bytes,
@@ -997,11 +1020,36 @@ class _ConversationScreenState extends State<ConversationScreen>
       kIsWeb ? const Duration(minutes: 2, seconds: 15) : const Duration(minutes: 10);
 
   Future<void> _startRecording() async {
-    if (_recording || _ended || _pickingAttachment) return;
+    if (_recording ||
+        _recordingStarting ||
+        _recorder.isStarting ||
+        _ended ||
+        _pickingAttachment) {
+      return;
+    }
     FocusScope.of(context).unfocus();
-    final started = await _recorder.start();
     if (!mounted) return;
+    setState(() => _recordingStarting = true);
+
+    bool started = false;
+    try {
+      started = await _recorder.start();
+    } catch (_) {
+      started = false;
+      // A platform error must not leave the button permanently disabled.
+      try {
+        await _recorder.cancel();
+      } catch (_) {}
+    }
+    if (!mounted || _ended) {
+      // Leave no microphone open if the screen was closed while permission
+      // was being requested.
+      unawaited(_recorder.cancel());
+      if (mounted) setState(() => _recordingStarting = false);
+      return;
+    }
     if (!started) {
+      setState(() => _recordingStarting = false);
       showAppSnack(
         context,
         'Microphone access is needed for voice notes. Allow it in your '
@@ -1012,8 +1060,9 @@ class _ConversationScreenState extends State<ConversationScreen>
     }
     HapticFeedback.mediumImpact();
     setState(() {
+      _recordingStarting = false;
       _recording = true;
-      _recordStartedAt = DateTime.now();
+      _recordStartedAt = serverClock.now();
       _recordElapsed = Duration.zero;
     });
     _recordTimer?.cancel();
@@ -1021,7 +1070,7 @@ class _ConversationScreenState extends State<ConversationScreen>
       if (!mounted || !_recording) return;
       final start = _recordStartedAt;
       if (start == null) return;
-      final elapsed = DateTime.now().difference(start);
+      final elapsed = serverClock.now().difference(start);
       setState(() => _recordElapsed = elapsed);
       if (elapsed >= _maxRecordingLength) {
         unawaited(_stopRecording(send: true));
@@ -1054,19 +1103,27 @@ class _ConversationScreenState extends State<ConversationScreen>
   }
 
   Future<void> _toggleVoice(ChatMessage message) async {
-    if (_ended) return;
-    if (_playingId == message.id) {
-      await _stopPlayback();
-      return;
-    }
-    if (_loadingAudioId != null) return;
-    await _stopPlayback();
-    setState(() {
-      _loadingAudioId = message.id;
-      _position = Duration.zero;
-    });
+    if (_ended || _audioBusy) return;
+    // One request owns the shared player and its temp file at a time. A quick
+    // second tap is ignored instead of racing setUrl or overwriting the file.
+    _audioBusy = true;
+    final request = ++_audioRequest;
+    Uri? pendingUri;
+    bool stale() => request != _audioRequest || !mounted || _ended;
 
     try {
+      if (_playingId == message.id) {
+        await _stopPlayback();
+        return;
+      }
+      if (_loadingAudioId != null) return;
+      await _stopPlayback();
+      if (stale()) return;
+      setState(() {
+        _loadingAudioId = message.id;
+        _position = Duration.zero;
+      });
+
       final local = message.localBytes;
       final AttachmentPayload payload;
       if (local != null) {
@@ -1078,7 +1135,7 @@ class _ConversationScreenState extends State<ConversationScreen>
       } else {
         payload = await _app.api.getAttachment(message.id);
       }
-      if (!mounted || _ended) return;
+      if (stale()) return;
 
       final mime = payload.mimeType.isEmpty
           ? (message.attachmentMime ?? 'audio/mp4')
@@ -1091,15 +1148,15 @@ class _ConversationScreenState extends State<ConversationScreen>
             ? 'webm'
             : 'm4a';
       }
-      final uri = await prepareAudio(payload.bytes, mime, extension);
-      if (!mounted || _ended) {
-        await cleanupAudio(uri);
-        return;
-      }
-      _audioUri = uri;
-      await _player.setUrl(uri.toString());
-      if (!mounted || _ended) {
+      pendingUri = await prepareAudio(payload.bytes, mime, extension);
+      if (stale()) return;
+
+      _audioUri = pendingUri;
+      await _player.setUrl(pendingUri.toString());
+      if (stale()) {
         await _stopPlayback();
+        // _stopPlayback cleaned the file owned by this request.
+        pendingUri = null;
         return;
       }
       setState(() {
@@ -1107,22 +1164,37 @@ class _ConversationScreenState extends State<ConversationScreen>
         _playingId = message.id;
       });
       await _player.play();
-      if (_ended) unawaited(_stopPlayback());
+      if (stale()) {
+        unawaited(_stopPlayback());
+      }
+      // The temp file stays alive until playback stops, or until the finally
+      // block below cleans a request that never reached playback.
+      pendingUri = null;
     } catch (e) {
+      try {
+        await _player.stop();
+      } catch (_) {
+        // The player may already be stopped or disposed.
+      }
       final uri = _audioUri;
       _audioUri = null;
-      await cleanupAudio(uri);
-      if (!mounted) return;
-      setState(() {
-        _loadingAudioId = null;
-        _playingId = null;
-        _position = Duration.zero;
-      });
-      showAppSnack(
-        context,
-        'That voice note could not be played.',
-        error: true,
-      );
+      if (uri != null) await cleanupAudio(uri);
+      pendingUri = null;
+      if (request == _audioRequest && mounted && !_ended) {
+        setState(() {
+          _loadingAudioId = null;
+          _playingId = null;
+          _position = Duration.zero;
+        });
+        showAppSnack(
+          context,
+          'That voice note could not be played.',
+          error: true,
+        );
+      }
+    } finally {
+      if (pendingUri != null) await cleanupAudio(pendingUri);
+      _audioBusy = false;
     }
   }
 
@@ -1431,8 +1503,9 @@ class _ConversationScreenState extends State<ConversationScreen>
       if (!mounted) return;
       _cleanupLive();
       HapticFeedback.mediumImpact();
-      showAppSnack(context, 'Conversation burned for both people.');
-      Navigator.of(context).pop();
+      // Let the previous screen confirm the burn after this route is gone, so
+      // the snack is not lost during the pop transition.
+      Navigator.of(context).pop(true);
     } catch (e) {
       if (!mounted) return;
       setState(() => _burning = false);

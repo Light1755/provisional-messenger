@@ -1,7 +1,9 @@
 {
     "name": "Provisional Messenger",
     "short_name": "Provisional",
-    "start_url": ".",
+    "id": "./",
+    "start_url": "./",
+    "scope": "./",
     "display": "standalone",
     "background_color": "#F5F6F3",
     "theme_color": "#3D8B7D",

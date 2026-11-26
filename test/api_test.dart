@@ -47,6 +47,10 @@ void main() {
         Api.mapPostgrest(dbError('message_too_long', '22023')).message,
         contains('4,000'),
       );
+      expect(
+        Api.mapPostgrest(dbError('conversation_storage_full', '22023')).message,
+        contains('storage limit'),
+      );
     });
 
     test('keeps unexpected messages intact', () {
@@ -76,6 +80,51 @@ void main() {
     });
   });
 
+  group('session classification', () {
+    test('recognizes definite session failures only', () {
+      expect(
+        Api.isDefiniteSessionError(
+          Api.mapAuth(const AuthException('User not found')),
+        ),
+        isTrue,
+      );
+      expect(
+        Api.isDefiniteSessionError(ApiException('expired', code: '401')),
+        isTrue,
+      );
+      expect(
+        Api.isDefiniteSessionError(
+          Api.mapPostgrest(dbError('something about a timeout')),
+        ),
+        isFalse,
+      );
+      expect(
+        Api.isDefiniteSessionError(
+          ApiException('The conversation has ended'),
+        ),
+        isFalse,
+      );
+      expect(
+        Api.isDefiniteSessionError(
+          Api.mapPostgrest(dbError('not_authenticated', '42501')),
+        ),
+        isFalse,
+      );
+      expect(
+        Api.isDefiniteSessionError(ApiException('Forbidden', code: '403')),
+        isFalse,
+      );
+    });
+
+    test('maps ended auth sessions to a retryable message', () {
+      final error = Api.mapAuth(
+        const AuthException('Auth session missing', code: 'session_not_found'),
+      );
+      expect(error.code, 'session_expired');
+      expect(error.message, contains('Tap Retry'));
+    });
+  });
+
   group('RPC response parsing', () {
     test('reads the first row from maps and lists', () {
       expect(Api.firstMap({'id': 'a'})?['id'], 'a');
@@ -87,6 +136,18 @@ void main() {
       expect(Api.rows([{'id': 'a'}, {'id': 'b'}]).length, 2);
       expect(Api.rows({'id': 'a'}).single['id'], 'a');
       expect(Api.rows('not rows'), isEmpty);
+    });
+
+    test('reads burn results from old and new servers', () {
+      expect(Api.burnResultSucceeded(null), isTrue);
+      expect(Api.burnResultSucceeded({'content_deleted': true}), isTrue);
+      expect(
+        Api.burnResultSucceeded([
+          {'content_deleted': true, 'auth_deleted': false},
+        ]),
+        isTrue,
+      );
+      expect(Api.burnResultSucceeded({'content_deleted': false}), isFalse);
     });
   });
 }

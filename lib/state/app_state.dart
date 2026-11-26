@@ -99,7 +99,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       try {
         profile = await api.getMyProfile();
       } on ApiException catch (e) {
-        if (e.code != 'orphan_session' && !_looksLikeSessionError(e)) rethrow;
+        if (!Api.isDefiniteSessionError(e)) rethrow;
         _sessionUnusable = true;
         try {
           if (e.code == 'orphan_session') {
@@ -116,8 +116,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
           _sessionUnusable = false;
         } catch (retryError) {
           if (retryError is! ApiException ||
-              (retryError.code != 'orphan_session' &&
-                  !_looksLikeSessionError(retryError))) {
+              !Api.isDefiniteSessionError(retryError)) {
             _sessionUnusable = false;
           }
           rethrow;
@@ -205,7 +204,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       _applyConversationList(list, request);
     } on ApiException catch (e) {
       if (_disposed || request != _conversationRequest) return;
-      if (!_looksLikeSessionError(e)) {
+      if (!Api.isDefiniteSessionError(e)) {
         _conversationsError = e.message;
       } else {
         // A session can expire while the app is open. Try one clean renewal;
@@ -223,8 +222,8 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
         }
         _sessionUnusable = true;
         _status = AppStatus.error;
-        _errorMessage = 'This session can no longer be used. Start a new '
-            'session to continue. Your old profile cannot be recovered.';
+        _errorMessage = 'This session is no longer valid. Tap Retry to '
+            'reconnect. Your old profile cannot be recovered.';
       }
     } catch (e) {
       if (_disposed || request != _conversationRequest) return;
@@ -446,19 +445,6 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
         lower.contains('user_not_found') ||
         lower.contains('session not found') ||
         lower.contains('auth session missing');
-  }
-
-  bool _looksLikeSessionError(ApiException e) {
-    final lower = e.message.toLowerCase();
-    final raw = e.raw?.toLowerCase() ?? '';
-    return e.code == 'orphan_session' ||
-        e.code == '401' ||
-        e.code == '403' ||
-        e.code == 'PGRST301' ||
-        lower.contains('session') ||
-        lower.contains('jwt') ||
-        raw.contains('user_not_found') ||
-        raw.contains('user not found');
   }
 
   String _messageFor(Object error) {
