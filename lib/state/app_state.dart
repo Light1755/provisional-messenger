@@ -38,9 +38,14 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   bool _sessionUnusable = false;
 
   Timer? _pollTimer;
+  Timer? _presenceTimer;
   Timer? _refreshDebounce;
   RealtimeChannel? _inboxChannel;
   int _conversationRequest = 0;
+
+  /// Best-effort presence reported by open conversation screens, keyed by the
+  /// partner's user id. It is display data only and never affects the profile.
+  final Map<String, PartnerPresence> _presenceById = {};
 
   AppStatus get status => _status;
   Profile? get me => _me;
@@ -65,6 +70,21 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       if (conversation.id == id) return conversation;
     }
     return null;
+  }
+
+  PartnerPresence? presenceFor(String userId) => _presenceById[userId];
+
+  /// Records a partner's presence so chat tiles can show an online dot.
+  void setPartnerPresence(PartnerPresence? presence) {
+    if (_disposed || presence == null) return;
+    final previous = _presenceById[presence.userId];
+    if (previous != null &&
+        previous.isOnline == presence.isOnline &&
+        previous.lastSeen == presence.lastSeen) {
+      return;
+    }
+    _presenceById[presence.userId] = presence;
+    _safeNotify();
   }
 
   Future<void> initialize() async {
@@ -303,6 +323,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
 
     _me = null;
     _conversations = const [];
+    _presenceById.clear();
     _teardownLive();
     _status = AppStatus.starting;
     _errorMessage = null;
@@ -358,12 +379,34 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     _pollTimer ??= Timer.periodic(const Duration(seconds: 20), (_) {
       if (!_disposed) refreshConversations(silent: true);
     });
+    _startPresence();
     unawaited(refreshConversations());
+  }
+
+  /// Presence is best-effort: failures are ignored and never alter the session
+  /// or the profile, which stay owned by initialize/createProfile/burnProfile.
+  void _startPresence() {
+    if (_disposed || _me == null) return;
+    unawaited(_touchPresence());
+    _presenceTimer ??= Timer.periodic(const Duration(seconds: 20), (_) {
+      unawaited(_touchPresence());
+    });
+  }
+
+  Future<void> _touchPresence() async {
+    if (_disposed || _me == null) return;
+    try {
+      await api.touchPresence();
+    } catch (_) {
+      // Keep the last known profile and session untouched.
+    }
   }
 
   void _teardownLive() {
     _pollTimer?.cancel();
     _pollTimer = null;
+    _presenceTimer?.cancel();
+    _presenceTimer = null;
     _refreshDebounce?.cancel();
     _refreshDebounce = null;
     final channel = _inboxChannel;
@@ -429,6 +472,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed && isReady) {
+      unawaited(_touchPresence());
       unawaited(refreshConversations(silent: true));
     }
   }
@@ -460,6 +504,8 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   @override
   void dispose() {
     _disposed = true;
+    _presenceTimer?.cancel();
+    _presenceTimer = null;
     _teardownLive();
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();

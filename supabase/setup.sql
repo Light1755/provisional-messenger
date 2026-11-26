@@ -11,6 +11,7 @@
 --   * username-only profiles tied to Supabase anonymous auth users
 --   * two-person conversations with a fixed expiry countdown
 --   * text, file (including images), and voice-note messages
+--   * replies, edits, soft-delete tombstones, reactions, and presence
 --   * row level security so only the two members can read a conversation
 --   * RPCs for account creation, search, sending, burning, and expiry
 --   * a pg_cron job that purges expired conversations in batches every minute
@@ -79,11 +80,20 @@ create table if not exists public.messages (
   duration_ms integer,
   client_id uuid not null,
   created_at timestamptz not null default now(),
+  reply_to_id uuid null references public.messages (id) on delete set null,
+  edited_at timestamptz null,
+  deleted_at timestamptz null,
+  delivered_at timestamptz null default now(),
+  -- Soft-deleted rows keep their id for reply tombstones but no longer carry
+  -- content, so the content checks must not apply to them.
   constraint messages_text_body check (
-    kind <> 'text' or (body is not null and length(body) between 1 and 4000)
+    deleted_at is not null
+    or kind <> 'text'
+    or (body is not null and length(body) between 1 and 4000)
   ),
   constraint messages_attachment_meta check (
-    kind not in ('file', 'voice')
+    deleted_at is not null
+    or kind not in ('file', 'voice')
     or (
       attachment_name is not null
       and attachment_mime is not null
@@ -92,7 +102,9 @@ create table if not exists public.messages (
     )
   ),
   constraint messages_voice_duration check (
-    kind <> 'voice' or (duration_ms is not null and duration_ms between 500 and 600000)
+    deleted_at is not null
+    or kind <> 'voice'
+    or (duration_ms is not null and duration_ms between 500 and 600000)
   ),
   constraint messages_client_id_key unique (conversation_id, sender_id, client_id)
 );
@@ -106,6 +118,22 @@ create table if not exists public.message_attachments (
   message_id uuid primary key references public.messages (id) on delete cascade,
   data bytea not null,
   constraint message_attachments_size check (octet_length(data) between 1 and 5242880)
+);
+
+-- One reaction per (message, user, emoji). Cascade on both sides so burning a
+-- conversation or an account removes every trace without a separate cleanup.
+create table if not exists public.message_reactions (
+  message_id uuid not null references public.messages (id) on delete cascade,
+  user_id uuid not null references auth.users (id) on delete cascade,
+  emoji text not null check (char_length(emoji) <= 8),
+  created_at timestamptz not null default now(),
+  primary key (message_id, user_id, emoji)
+);
+
+-- Only a user id and a timestamp; no profile text or message content.
+create table if not exists public.user_presence (
+  user_id uuid primary key references auth.users (id) on delete cascade,
+  last_seen timestamptz not null default now()
 );
 
 -- A DELETE event's old conversation row cannot pass RLS after its member rows
@@ -256,6 +284,8 @@ alter table public.conversations enable row level security;
 alter table public.conversation_members enable row level security;
 alter table public.messages enable row level security;
 alter table public.message_attachments enable row level security;
+alter table public.message_reactions enable row level security;
+alter table public.user_presence enable row level security;
 alter table public.conversation_deletions enable row level security;
 
 drop policy if exists profiles_select on public.profiles;
@@ -300,6 +330,18 @@ create policy conversation_deletions_select on public.conversation_deletions
 for select to authenticated
 using (auth.uid() = any(member_ids));
 
+drop policy if exists message_reactions_select on public.message_reactions;
+create policy message_reactions_select on public.message_reactions
+for select to authenticated
+using (public.can_access_message(message_id));
+
+-- Presence contains only an opaque user id and a timestamp, so any signed-in
+-- client may read it and decide whether its partner is online.
+drop policy if exists user_presence_select on public.user_presence;
+create policy user_presence_select on public.user_presence
+for select to authenticated
+using (true);
+
 -- All writes go through the SECURITY DEFINER RPCs below. Direct table writes
 -- are denied, which keeps validation and cascading deletes in one place.
 revoke all on public.profiles from anon, authenticated;
@@ -307,6 +349,8 @@ revoke all on public.conversations from anon, authenticated;
 revoke all on public.conversation_members from anon, authenticated;
 revoke all on public.messages from anon, authenticated;
 revoke all on public.message_attachments from anon, authenticated;
+revoke all on public.message_reactions from anon, authenticated;
+revoke all on public.user_presence from anon, authenticated;
 revoke all on public.conversation_deletions from anon, authenticated;
 
 grant select on public.profiles to authenticated;
@@ -314,6 +358,8 @@ grant select on public.conversations to authenticated;
 grant select on public.conversation_members to authenticated;
 grant select on public.messages to authenticated;
 grant select on public.message_attachments to authenticated;
+grant select on public.message_reactions to authenticated;
+grant select on public.user_presence to authenticated;
 grant select on public.conversation_deletions to authenticated;
 
 -- ---------------------------------------------------------------------------
@@ -735,10 +781,14 @@ $$;
 -- 7. Message RPCs
 -- ---------------------------------------------------------------------------
 
+-- Dropped first because the trailing reply-to parameter changes the signature.
+drop function if exists public.send_text_message(uuid, uuid, text);
+
 create or replace function public.send_text_message(
   p_conversation_id uuid,
   p_client_id uuid,
-  p_body text
+  p_body text,
+  p_reply_to_id uuid default null
 )
 returns public.messages
 language plpgsql
@@ -771,6 +821,18 @@ begin
     raise exception 'message_too_long' using errcode = '22023';
   end if;
 
+  -- Replies must point at a live message in this same conversation; a
+  -- soft-deleted target is a tombstone and cannot be replied to.
+  if p_reply_to_id is not null and not exists (
+    select 1
+    from public.messages
+    where id = p_reply_to_id
+      and conversation_id = p_conversation_id
+      and deleted_at is null
+  ) then
+    raise exception 'invalid_reply_target' using errcode = '22023';
+  end if;
+
   select * into v_msg
   from public.messages
   where conversation_id = p_conversation_id
@@ -790,8 +852,12 @@ begin
   end if;
 
   begin
-    insert into public.messages (conversation_id, sender_id, kind, body, client_id)
-    values (p_conversation_id, v_uid, 'text', v_body, p_client_id)
+    insert into public.messages (
+      conversation_id, sender_id, kind, body, client_id, reply_to_id
+    )
+    values (
+      p_conversation_id, v_uid, 'text', v_body, p_client_id, p_reply_to_id
+    )
     returning * into v_msg;
   exception
     when unique_violation then
@@ -814,6 +880,9 @@ begin
 end;
 $$;
 
+-- Dropped first because the trailing reply-to parameter changes the signature.
+drop function if exists public.send_attachment_message(uuid, uuid, text, text, text, integer, text);
+
 create or replace function public.send_attachment_message(
   p_conversation_id uuid,
   p_client_id uuid,
@@ -821,7 +890,8 @@ create or replace function public.send_attachment_message(
   p_file_name text,
   p_mime text,
   p_duration_ms integer,
-  p_data_base64 text
+  p_data_base64 text,
+  p_reply_to_id uuid default null
 )
 returns public.messages
 language plpgsql
@@ -849,6 +919,17 @@ begin
 
   if not public.is_conversation_member(p_conversation_id) then
     raise exception 'conversation_not_found' using errcode = 'P0002';
+  end if;
+
+  -- Replies must point at a live message in this same conversation.
+  if p_reply_to_id is not null and not exists (
+    select 1
+    from public.messages
+    where id = p_reply_to_id
+      and conversation_id = p_conversation_id
+      and deleted_at is null
+  ) then
+    raise exception 'invalid_reply_target' using errcode = '22023';
   end if;
 
   if v_kind is null or v_kind not in ('file', 'voice') then
@@ -929,11 +1010,11 @@ begin
   begin
     insert into public.messages (
       conversation_id, sender_id, kind, attachment_name, attachment_mime,
-      attachment_size, duration_ms, client_id
+      attachment_size, duration_ms, client_id, reply_to_id
     )
     values (
       p_conversation_id, v_uid, v_kind, v_name, v_mime,
-      v_size, p_duration_ms, p_client_id
+      v_size, p_duration_ms, p_client_id, p_reply_to_id
     )
     returning * into v_msg;
 
@@ -980,7 +1061,9 @@ as $$
     and public.is_conversation_member(m.conversation_id);
 $$;
 
-drop function if exists public.get_messages(uuid, timestamptz, integer);
+-- Dropped first because the output columns changed; CREATE OR REPLACE cannot
+-- change the shape of an existing table function.
+drop function if exists public.get_messages(uuid, timestamptz, integer, uuid);
 
 create or replace function public.get_messages(
   p_conversation_id uuid,
@@ -1003,7 +1086,16 @@ returns table (
   client_id uuid,
   created_at timestamptz,
   is_mine boolean,
-  is_read boolean
+  is_read boolean,
+  reply_to_id uuid,
+  reply_to_body text,
+  reply_to_kind text,
+  reply_to_sender_id uuid,
+  reply_to_sender_username text,
+  edited_at timestamptz,
+  deleted_at timestamptz,
+  delivered_at timestamptz,
+  reactions jsonb
 )
 language sql
 stable
@@ -1036,9 +1128,33 @@ as $$
             and other_cm.user_id <> auth.uid()
           limit 1
         ), false)
-      end as is_read
+      end as is_read,
+      m.reply_to_id,
+      rt.body as reply_to_body,
+      rt.kind as reply_to_kind,
+      rt.sender_id as reply_to_sender_id,
+      rtp.username as reply_to_sender_username,
+      m.edited_at,
+      m.deleted_at,
+      m.delivered_at,
+      coalesce((
+        select jsonb_agg(
+          jsonb_build_object(
+            'emoji', r.emoji,
+            'user_id', r.user_id,
+            'username', rp.username,
+            'accent', rp.accent
+          )
+          order by r.created_at, r.user_id, r.emoji
+        )
+        from public.message_reactions r
+        left join public.profiles rp on rp.id = r.user_id
+        where r.message_id = m.id
+      ), '[]'::jsonb) as reactions
     from public.messages m
     join public.profiles p on p.id = m.sender_id
+    left join public.messages rt on rt.id = m.reply_to_id
+    left join public.profiles rtp on rtp.id = rt.sender_id
     where m.conversation_id = p_conversation_id
       and public.is_conversation_member(m.conversation_id)
       and (
@@ -1052,6 +1168,230 @@ as $$
     limit greatest(1, least(coalesce(p_limit, 100), 200))
   ) recent
   order by recent.created_at asc, recent.message_id asc;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- 7b. Message interactions and presence
+-- ---------------------------------------------------------------------------
+
+-- Dropped first so a rerun can also replace an older return shape.
+drop function if exists public.edit_message(uuid, text);
+
+create or replace function public.edit_message(
+  p_message_id uuid,
+  p_body text
+)
+returns public.messages
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  v_uid uuid := auth.uid();
+  v_body text := trim(p_body);
+  v_msg public.messages;
+begin
+  if v_uid is null then
+    raise exception 'not_authenticated' using errcode = '28000';
+  end if;
+
+  if v_body is null or char_length(v_body) < 1 or char_length(v_body) > 4000 then
+    raise exception 'invalid_body' using errcode = '22023';
+  end if;
+
+  if not public.can_access_message(p_message_id) then
+    raise exception 'message_not_found' using errcode = 'P0002';
+  end if;
+
+  update public.messages
+  set body = v_body, edited_at = now()
+  where id = p_message_id
+    and sender_id = v_uid
+    and kind = 'text'
+    and deleted_at is null
+  returning * into v_msg;
+
+  if not found then
+    raise exception 'message_not_found' using errcode = 'P0002';
+  end if;
+
+  return v_msg;
+end;
+$$;
+
+-- Dropped first so a rerun can also replace an older return shape.
+drop function if exists public.delete_message(uuid);
+
+create or replace function public.delete_message(p_message_id uuid)
+returns void
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  v_uid uuid := auth.uid();
+begin
+  if v_uid is null then
+    raise exception 'not_authenticated' using errcode = '28000';
+  end if;
+
+  if not public.can_access_message(p_message_id) then
+    raise exception 'message_not_found' using errcode = 'P0002';
+  end if;
+
+  -- Soft delete: the UPDATE is the Realtime signal, so the row itself stays
+  -- and every piece of content is cleared. Replies to it become tombstones.
+  update public.messages
+  set deleted_at = now(),
+      body = null,
+      attachment_name = null,
+      attachment_mime = null,
+      attachment_size = null,
+      duration_ms = null
+  where id = p_message_id
+    and sender_id = v_uid
+    and deleted_at is null;
+
+  if not found then
+    raise exception 'message_not_found' using errcode = 'P0002';
+  end if;
+
+  delete from public.message_attachments where message_id = p_message_id;
+end;
+$$;
+
+drop function if exists public.add_reaction(uuid, text);
+
+create or replace function public.add_reaction(
+  p_message_id uuid,
+  p_emoji text
+)
+returns void
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  if auth.uid() is null then
+    raise exception 'not_authenticated' using errcode = '28000';
+  end if;
+
+  if p_emoji is null or char_length(p_emoji) < 1 or char_length(p_emoji) > 8 then
+    raise exception 'invalid_emoji' using errcode = '22023';
+  end if;
+
+  if not public.can_access_message(p_message_id) then
+    raise exception 'message_not_found' using errcode = 'P0002';
+  end if;
+
+  if exists (
+    select 1 from public.messages
+    where id = p_message_id and deleted_at is not null
+  ) then
+    raise exception 'message_deleted' using errcode = '22023';
+  end if;
+
+  insert into public.message_reactions (message_id, user_id, emoji)
+  values (p_message_id, auth.uid(), p_emoji)
+  on conflict (message_id, user_id, emoji) do nothing;
+end;
+$$;
+
+drop function if exists public.remove_reaction(uuid, text);
+
+create or replace function public.remove_reaction(
+  p_message_id uuid,
+  p_emoji text
+)
+returns void
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  if auth.uid() is null then
+    raise exception 'not_authenticated' using errcode = '28000';
+  end if;
+
+  if p_emoji is null or char_length(p_emoji) < 1 or char_length(p_emoji) > 8 then
+    raise exception 'invalid_emoji' using errcode = '22023';
+  end if;
+
+  if not public.can_access_message(p_message_id) then
+    raise exception 'message_not_found' using errcode = 'P0002';
+  end if;
+
+  if exists (
+    select 1 from public.messages
+    where id = p_message_id and deleted_at is not null
+  ) then
+    raise exception 'message_deleted' using errcode = '22023';
+  end if;
+
+  delete from public.message_reactions
+  where message_id = p_message_id
+    and user_id = auth.uid()
+    and emoji = p_emoji;
+end;
+$$;
+
+drop function if exists public.touch_presence();
+
+create or replace function public.touch_presence()
+returns timestamptz
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  v_uid uuid := auth.uid();
+  v_now timestamptz;
+begin
+  if v_uid is null then
+    raise exception 'not_authenticated' using errcode = '28000';
+  end if;
+
+  insert into public.user_presence (user_id, last_seen)
+  values (v_uid, now())
+  on conflict (user_id) do update set last_seen = excluded.last_seen
+  returning last_seen into v_now;
+
+  return v_now;
+end;
+$$;
+
+drop function if exists public.get_partner_presence(uuid);
+
+create or replace function public.get_partner_presence(p_conversation_id uuid)
+returns table (
+  user_id uuid,
+  last_seen timestamptz,
+  is_online boolean
+)
+language plpgsql
+stable
+security definer
+set search_path = ''
+as $$
+begin
+  if auth.uid() is null then
+    raise exception 'not_authenticated' using errcode = '28000';
+  end if;
+
+  if not public.is_conversation_member(p_conversation_id) then
+    raise exception 'conversation_not_found' using errcode = 'P0002';
+  end if;
+
+  -- A partner who has never checked in still gets a row, marked offline.
+  return query
+  select cm.user_id,
+         up.last_seen,
+         coalesce(up.last_seen >= now() - interval '30 seconds', false)
+  from public.conversation_members cm
+  left join public.user_presence up on up.user_id = cm.user_id
+  where cm.conversation_id = p_conversation_id
+    and cm.user_id <> auth.uid();
+end;
 $$;
 
 -- ---------------------------------------------------------------------------
@@ -1144,7 +1484,7 @@ begin
       and to_regclass('public.messages') is not null
       and to_regclass('public.message_attachments') is not null,
     'app', 'provisional-messenger',
-    'schema_version', 4,
+    'schema_version', 5,
     'cron_ok', v_cron_ok,
     'server_now', now()
   );
@@ -1165,10 +1505,16 @@ revoke all on function public.mark_conversation_read(uuid) from public, anon;
 revoke all on function public.burn_conversation(uuid) from public, anon;
 revoke all on function public.list_conversations() from public, anon;
 revoke all on function public.get_conversation(uuid) from public, anon;
-revoke all on function public.send_text_message(uuid, uuid, text) from public, anon;
-revoke all on function public.send_attachment_message(uuid, uuid, text, text, text, integer, text) from public, anon;
+revoke all on function public.send_text_message(uuid, uuid, text, uuid) from public, anon;
+revoke all on function public.send_attachment_message(uuid, uuid, text, text, text, integer, text, uuid) from public, anon;
 revoke all on function public.get_attachment(uuid) from public, anon;
 revoke all on function public.get_messages(uuid, timestamptz, integer, uuid) from public, anon;
+revoke all on function public.edit_message(uuid, text) from public, anon;
+revoke all on function public.delete_message(uuid) from public, anon;
+revoke all on function public.add_reaction(uuid, text) from public, anon;
+revoke all on function public.remove_reaction(uuid, text) from public, anon;
+revoke all on function public.touch_presence() from public, anon;
+revoke all on function public.get_partner_presence(uuid) from public, anon;
 revoke all on function public.purge_expired_conversations() from public, anon, authenticated;
 revoke all on function public.is_conversation_member(uuid) from public, anon;
 revoke all on function public.can_access_message(uuid) from public, anon;
@@ -1187,10 +1533,16 @@ grant execute on function public.mark_conversation_read(uuid) to authenticated;
 grant execute on function public.burn_conversation(uuid) to authenticated;
 grant execute on function public.list_conversations() to authenticated;
 grant execute on function public.get_conversation(uuid) to authenticated;
-grant execute on function public.send_text_message(uuid, uuid, text) to authenticated;
-grant execute on function public.send_attachment_message(uuid, uuid, text, text, text, integer, text) to authenticated;
+grant execute on function public.send_text_message(uuid, uuid, text, uuid) to authenticated;
+grant execute on function public.send_attachment_message(uuid, uuid, text, text, text, integer, text, uuid) to authenticated;
 grant execute on function public.get_attachment(uuid) to authenticated;
 grant execute on function public.get_messages(uuid, timestamptz, integer, uuid) to authenticated;
+grant execute on function public.edit_message(uuid, text) to authenticated;
+grant execute on function public.delete_message(uuid) to authenticated;
+grant execute on function public.add_reaction(uuid, text) to authenticated;
+grant execute on function public.remove_reaction(uuid, text) to authenticated;
+grant execute on function public.touch_presence() to authenticated;
+grant execute on function public.get_partner_presence(uuid) to authenticated;
 grant execute on function public.is_conversation_member(uuid) to authenticated;
 grant execute on function public.can_access_message(uuid) to authenticated;
 grant execute on function public.health_check() to anon, authenticated;
@@ -1242,6 +1594,24 @@ begin
         and tablename = 'conversation_deletions'
     ) then
       execute 'alter publication supabase_realtime add table public.conversation_deletions';
+    end if;
+
+    if not exists (
+      select 1 from pg_publication_tables
+      where pubname = 'supabase_realtime'
+        and schemaname = 'public'
+        and tablename = 'message_reactions'
+    ) then
+      execute 'alter publication supabase_realtime add table public.message_reactions';
+    end if;
+
+    if not exists (
+      select 1 from pg_publication_tables
+      where pubname = 'supabase_realtime'
+        and schemaname = 'public'
+        and tablename = 'user_presence'
+    ) then
+      execute 'alter publication supabase_realtime add table public.user_presence';
     end if;
   exception
     when undefined_object then

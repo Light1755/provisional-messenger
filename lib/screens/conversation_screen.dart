@@ -85,8 +85,16 @@ class _ConversationScreenState extends State<ConversationScreen>
 
   RealtimeChannel? _channel;
   Timer? _pollTimer;
+  Timer? _presenceTimer;
   Timer? _readDebounce;
   Timer? _syncDebounce;
+  Timer? _typingStopTimer;
+  Timer? _partnerTypingTimer;
+  DateTime? _lastTypingSent;
+  bool _typingSent = false;
+  bool _partnerTyping = false;
+  PartnerPresence? _presence;
+  ChatMessage? _replyTarget;
   bool _polling = false;
   int _messageRequest = 0;
   DateTime? _lastReadThrough;
@@ -125,6 +133,7 @@ class _ConversationScreenState extends State<ConversationScreen>
     if (_foreground && !_ended && mounted) {
       if (_pendingRead) _markReadSoon();
       unawaited(_poll());
+      unawaited(_pollPresence());
     }
   }
 
@@ -210,6 +219,31 @@ class _ConversationScreenState extends State<ConversationScreen>
           ),
           callback: (payload) => _onIncomingMessage(payload.newRecord),
         )
+        // Edits and soft-deletes arrive as UPDATEs. A full sync keeps the new
+        // body/tombstone and reacted rows consistent without guessing columns.
+        .onPostgresChanges(
+          event: PostgresChangeEvent.update,
+          schema: 'public',
+          table: 'messages',
+          filter: PostgresChangeFilter(
+            type: PostgresChangeFilterType.eq,
+            column: 'conversation_id',
+            value: _conversationId,
+          ),
+          callback: (payload) => _scheduleMessageSync(),
+        )
+        .onPostgresChanges(
+          event: PostgresChangeEvent.insert,
+          schema: 'public',
+          table: 'message_reactions',
+          callback: (_) => _scheduleMessageSync(),
+        )
+        .onPostgresChanges(
+          event: PostgresChangeEvent.delete,
+          schema: 'public',
+          table: 'message_reactions',
+          callback: (_) => _scheduleMessageSync(),
+        )
         .onPostgresChanges(
           event: PostgresChangeEvent.update,
           schema: 'public',
@@ -273,6 +307,10 @@ class _ConversationScreenState extends State<ConversationScreen>
           },
         )
         .onBroadcast(
+          event: 'typing',
+          callback: _onTypingBroadcast,
+        )
+        .onBroadcast(
           event: 'burned',
           callback: (_) => _end(_EndReason.burned),
         )
@@ -281,11 +319,21 @@ class _ConversationScreenState extends State<ConversationScreen>
     _pollTimer ??= Timer.periodic(const Duration(seconds: 15), (_) {
       unawaited(_poll());
     });
+    _presenceTimer ??= Timer.periodic(const Duration(seconds: 15), (_) {
+      unawaited(_pollPresence());
+    });
+    unawaited(_pollPresence());
   }
 
   void _cleanupLive() {
     _pollTimer?.cancel();
     _pollTimer = null;
+    _presenceTimer?.cancel();
+    _presenceTimer = null;
+    _typingStopTimer?.cancel();
+    _typingStopTimer = null;
+    _partnerTypingTimer?.cancel();
+    _partnerTypingTimer = null;
     _readDebounce?.cancel();
     _readDebounce = null;
     _syncDebounce?.cancel();
@@ -322,6 +370,92 @@ class _ConversationScreenState extends State<ConversationScreen>
       // Realtime and the next poll retry quietly. The current view stays.
     } finally {
       _polling = false;
+    }
+  }
+
+  Future<void> _pollPresence() async {
+    if (!mounted || _ended) return;
+    try {
+      final presence = await _app.api.getPartnerPresence(_conversationId);
+      if (!mounted || _ended) return;
+      _app.setPartnerPresence(presence);
+      if (_presence?.isOnline != presence?.isOnline ||
+          _presence?.lastSeen != presence?.lastSeen) {
+        setState(() => _presence = presence);
+      }
+    } catch (_) {
+      // Presence is optional; keep the last known label.
+    }
+  }
+
+  void _onTypingBroadcast(Map<String, dynamic> payload) {
+    if (!mounted || _ended) return;
+    // The SDK hands over the broadcast envelope; tolerate a bare payload too.
+    final inner = payload['payload'];
+    final data = inner is Map ? Map<String, dynamic>.from(inner) : payload;
+    final userId = data['user_id'] as String?;
+    final myId = _app.me?.id;
+    if (userId == null || userId == myId) return;
+    final partnerId = _detail?.partnerId;
+    if (partnerId != null && userId != partnerId) return;
+
+    final typing = data['typing'] as bool? ?? false;
+    _partnerTypingTimer?.cancel();
+    if (!typing) {
+      setState(() => _partnerTyping = false);
+      return;
+    }
+    setState(() => _partnerTyping = true);
+    _partnerTypingTimer = Timer(const Duration(seconds: 4), () {
+      if (mounted && !_ended) setState(() => _partnerTyping = false);
+    });
+  }
+
+  void _onComposerChanged(String text) {
+    if (_ended) return;
+    if (text.trim().isEmpty) {
+      if (_typingSent) _sendTyping(false);
+      return;
+    }
+    final last = _lastTypingSent;
+    if (last != null && serverClock.now().difference(last).inSeconds < 1) {
+      // Keep the "stopped typing" timer pushed back while the user types.
+      _typingStopTimer?.cancel();
+      _typingStopTimer = Timer(const Duration(seconds: 2), () {
+        if (mounted && !_ended) _sendTyping(false);
+      });
+      return;
+    }
+    _sendTyping(true);
+  }
+
+  void _sendTyping(bool typing) {
+    final channel = _channel;
+    final me = _app.me;
+    if (channel == null || me == null || _ended) return;
+    _typingSent = typing;
+    _lastTypingSent = serverClock.now();
+    unawaited(_broadcastTyping(channel, me.id, typing));
+    _typingStopTimer?.cancel();
+    if (typing) {
+      _typingStopTimer = Timer(const Duration(seconds: 2), () {
+        if (mounted && !_ended) _sendTyping(false);
+      });
+    }
+  }
+
+  Future<void> _broadcastTyping(
+    RealtimeChannel channel,
+    String userId,
+    bool typing,
+  ) async {
+    try {
+      await channel.sendBroadcastMessage(
+        event: 'typing',
+        payload: {'user_id': userId, 'typing': typing},
+      );
+    } catch (_) {
+      // Typing is a nicety; the next keystroke or poll re-syncs if needed.
     }
   }
 
@@ -668,6 +802,7 @@ class _ConversationScreenState extends State<ConversationScreen>
     if (me == null) return;
 
     final clientId = _uuid.v4();
+    final reply = _replyTarget;
     final optimistic = ChatMessage(
       id: 'local-$clientId',
       conversationId: _conversationId,
@@ -680,10 +815,15 @@ class _ConversationScreenState extends State<ConversationScreen>
       createdAt: serverClock.now(),
       isMine: true,
       status: MessageStatus.sending,
+      replyToId: reply?.id,
+      replyToBody: reply?.body,
+      replyToSenderUsername: reply?.senderUsername,
     );
 
     _composer.clear();
+    _sendTyping(false);
     setState(() {
+      if (reply != null) _replyTarget = null;
       _messages = [..._messages, optimistic];
       _sortMessages(_messages);
     });
@@ -702,6 +842,7 @@ class _ConversationScreenState extends State<ConversationScreen>
           clientId: message.clientId,
           body: message.body ?? '',
           me: me,
+          replyToId: message.replyToId,
         );
       } else {
         final bytes = message.localBytes;
@@ -725,14 +866,18 @@ class _ConversationScreenState extends State<ConversationScreen>
           bytes: bytes,
           durationMs: message.durationMs,
           me: me,
+          replyToId: message.replyToId,
         );
       }
 
+      // The RPC confirms the server accepted the row: one check. Read receipts
+      // from fetched rows upgrade it to two checks.
+      final confirmed = sent.copyWith(status: MessageStatus.delivered);
       _replaceOptimistic(
         message.clientId,
         message.localBytes == null
-            ? sent
-            : sent.copyWith(localBytes: message.localBytes),
+            ? confirmed
+            : confirmed.copyWith(localBytes: message.localBytes),
       );
     } catch (e) {
       _markFailed(message.clientId);
@@ -797,6 +942,228 @@ class _ConversationScreenState extends State<ConversationScreen>
     unawaited(_deliver(retry));
   }
 
+  // --- message actions ---------------------------------------------------
+
+  static const _reactions = ['👍', '❤️', '😂', '😮', '😢', '🙏'];
+
+  void _startReply(ChatMessage message) {
+    if (_ended) return;
+    setState(() => _replyTarget = message);
+    _composerFocus.requestFocus();
+  }
+
+  void _cancelReply() {
+    if (_replyTarget == null) return;
+    setState(() => _replyTarget = null);
+  }
+
+  Future<void> _editMessage(ChatMessage message) async {
+    if (_ended || message.kind != MessageKind.text || message.isDeleted) return;
+    final controller = TextEditingController(text: message.body ?? '');
+    final result = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Edit message'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          minLines: 1,
+          maxLines: 5,
+          maxLength: 4000,
+          decoration: const InputDecoration(
+            hintText: 'Message',
+            counterText: '',
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () {
+              final text = controller.text.trim();
+              if (text.isEmpty || text.length > 4000) return;
+              Navigator.of(dialogContext).pop(text);
+            },
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+    controller.dispose();
+    if (result == null || !mounted || _ended) return;
+    try {
+      await _app.api.editMessage(message.id, result);
+      if (!mounted || _ended) return;
+      showAppSnack(context, 'Message edited.');
+      // Re-fetch carries edited_at and the new body from the server row.
+      unawaited(_fetchMessages());
+    } catch (e) {
+      if (mounted) showAppSnack(context, _messageFor(e), error: true);
+    }
+  }
+
+  Future<void> _deleteMessage(ChatMessage message) async {
+    if (_ended || message.isDeleted) return;
+    try {
+      await _app.api.deleteMessage(message.id);
+      if (!mounted || _ended) return;
+      showAppSnack(context, 'Message deleted.');
+      unawaited(_fetchMessages());
+    } catch (e) {
+      if (mounted) showAppSnack(context, _messageFor(e), error: true);
+    }
+  }
+
+  Future<void> _showReactionPicker(ChatMessage message) async {
+    if (_ended || message.isDeleted) return;
+    final emoji = await showAppSheet<String>(
+      context,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(20, 8, 20, 20),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'React',
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800),
+            ),
+            const SizedBox(height: 12),
+            Wrap(
+              spacing: 10,
+              runSpacing: 10,
+              children: [
+                for (final value in _reactions)
+                  _EmojiChoice(
+                    emoji: value,
+                    onTap: () => Navigator.of(context).pop(value),
+                  ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+    if (emoji == null || !mounted) return;
+    await _toggleReaction(message, emoji);
+  }
+
+  Future<void> _toggleReaction(ChatMessage message, String emoji) async {
+    if (_ended || message.isDeleted) return;
+    final me = _app.me;
+    if (me == null) return;
+    final mine = message.reactions.any(
+      (reaction) => reaction.emoji == emoji && reaction.userId == me.id,
+    );
+    try {
+      if (mine) {
+        await _app.api.removeReaction(message.id, emoji);
+      } else {
+        await _app.api.addReaction(message.id, emoji);
+      }
+      if (!mounted || _ended) return;
+      unawaited(_fetchMessages());
+    } catch (e) {
+      if (mounted) showAppSnack(context, _messageFor(e), error: true);
+    }
+  }
+
+  Future<void> _forwardMessage(ChatMessage message) async {
+    if (_ended || message.isDeleted) return;
+    final targets = _app.conversations
+        .where(
+          (conversation) =>
+              conversation.id != _conversationId &&
+              conversation.expiresAt.isAfter(serverClock.now()),
+        )
+        .toList(growable: false);
+    if (targets.isEmpty) {
+      showAppSnack(context, 'No other conversations to forward to.');
+      return;
+    }
+    final target = await showAppSheet<ConversationSummary>(
+      context,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(20, 8, 20, 18),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'Forward to',
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800),
+            ),
+            const SizedBox(height: 8),
+            Flexible(
+              child: ListView.builder(
+                shrinkWrap: true,
+                itemCount: targets.length,
+                itemBuilder: (context, index) {
+                  final conversation = targets[index];
+                  return ListTile(
+                    leading: Avatar(
+                      username: conversation.partnerUsername,
+                      accent: conversation.partnerAccent,
+                      size: 38,
+                    ),
+                    title: Text(conversation.partnerUsername),
+                    subtitle: Text(
+                      'Expires ${formatExpiryDate(conversation.expiresAt)}',
+                    ),
+                    onTap: () => Navigator.of(context).pop(conversation),
+                  );
+                },
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (target == null || !mounted || _ended) return;
+    final me = _app.me;
+    if (me == null) return;
+
+    try {
+      if (message.kind == MessageKind.text) {
+        await _app.api.sendText(
+          conversationId: target.id,
+          clientId: _uuid.v4(),
+          body: message.body ?? '',
+          me: me,
+        );
+      } else {
+        final local = message.localBytes;
+        final payload = local != null
+            ? AttachmentPayload(
+                name: message.attachmentName ?? message.displayName,
+                mimeType: message.attachmentMime ?? 'application/octet-stream',
+                bytes: local,
+              )
+            : await _app.api.getAttachment(message.id);
+        if (!mounted || _ended) return;
+        await _app.api.sendAttachment(
+          conversationId: target.id,
+          clientId: _uuid.v4(),
+          kind: message.kind,
+          fileName: payload.name,
+          mimeType: payload.mimeType.isEmpty
+              ? (message.attachmentMime ?? 'application/octet-stream')
+              : payload.mimeType,
+          bytes: payload.bytes,
+          durationMs: message.durationMs,
+          me: me,
+        );
+      }
+      if (!mounted) return;
+      showAppSnack(context, 'Forwarded to ${target.partnerUsername}.');
+      unawaited(_app.refreshConversations(silent: true));
+    } catch (e) {
+      if (mounted) showAppSnack(context, _messageFor(e), error: true);
+    }
+  }
+
   Future<void> _queueAttachment({
     required MessageKind kind,
     required String fileName,
@@ -825,6 +1192,7 @@ class _ConversationScreenState extends State<ConversationScreen>
     if (me == null || !mounted) return;
 
     final clientId = _uuid.v4();
+    final reply = _replyTarget;
     final optimistic = ChatMessage(
       id: 'local-$clientId',
       conversationId: _conversationId,
@@ -841,8 +1209,12 @@ class _ConversationScreenState extends State<ConversationScreen>
       isMine: true,
       status: MessageStatus.sending,
       localBytes: bytes,
+      replyToId: reply?.id,
+      replyToBody: reply?.body,
+      replyToSenderUsername: reply?.senderUsername,
     );
     setState(() {
+      if (reply != null) _replyTarget = null;
       _messages = [..._messages, optimistic];
       _sortMessages(_messages);
     });
@@ -1518,6 +1890,14 @@ class _ConversationScreenState extends State<ConversationScreen>
     return 'Something went wrong. Check your connection and try again.';
   }
 
+  String get _presenceLabel {
+    final presence = _presence;
+    if (presence == null) return 'Private · tap for chat settings';
+    if (presence.isOnline) return 'Online';
+    final seen = presence.lastSeen;
+    return seen == null ? 'Offline' : 'Last seen ${formatChatListTime(seen)}';
+  }
+
   @override
   Widget build(BuildContext context) {
     final ended = _ended;
@@ -1566,22 +1946,35 @@ class _ConversationScreenState extends State<ConversationScreen>
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text(
-                      _partnerName,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
-                        fontSize: 16,
-                        fontWeight: FontWeight.w700,
-                        letterSpacing: -.3,
-                        color: scheme.onSurface,
-                      ),
+                    Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Flexible(
+                          child: Text(
+                            _partnerName,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontSize: 16,
+                              fontWeight: FontWeight.w700,
+                              letterSpacing: -.3,
+                              color: scheme.onSurface,
+                            ),
+                          ),
+                        ),
+                        if (!ended) ...[
+                          const SizedBox(width: 6),
+                          PresenceDot(online: _presence?.isOnline ?? false),
+                        ],
+                      ],
                     ),
                     const SizedBox(height: 1),
                     Text(
                       ended
                           ? 'Conversation ended'
-                          : 'Private · tap for chat settings',
+                          : _partnerTyping
+                          ? 'typing…'
+                          : _presenceLabel,
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                       style: TextStyle(
@@ -1742,7 +2135,9 @@ class _ConversationScreenState extends State<ConversationScreen>
                             previous.senderId != message.senderId ||
                             showDate);
                     final failed = message.status == MessageStatus.failed;
-                    final settled = message.status == MessageStatus.sent;
+                    final settled =
+                        message.status == MessageStatus.sent ||
+                        message.status == MessageStatus.delivered;
 
                     return Column(
                       children: [
@@ -1773,6 +2168,30 @@ class _ConversationScreenState extends State<ConversationScreen>
                                   settled
                               ? () => unawaited(_saveAttachment(message))
                               : null,
+                          onReply: () => _startReply(message),
+                          onForward: settled && !message.isDeleted
+                              ? () => unawaited(_forwardMessage(message))
+                              : null,
+                          onEdit:
+                              settled &&
+                                  message.isMine &&
+                                  message.kind == MessageKind.text &&
+                                  !message.isDeleted
+                              ? () => unawaited(_editMessage(message))
+                              : null,
+                          onDelete:
+                              settled && message.isMine && !message.isDeleted
+                              ? () => unawaited(_deleteMessage(message))
+                              : null,
+                          onReact: settled && !message.isDeleted
+                              ? () => unawaited(_showReactionPicker(message))
+                              : null,
+                          onReactionTap: settled && !message.isDeleted
+                              ? (emoji) => unawaited(
+                                    _toggleReaction(message, emoji),
+                                  )
+                              : null,
+                          myUserId: _app.me?.id,
                         ),
                       ],
                     );
@@ -1811,13 +2230,20 @@ class _ConversationScreenState extends State<ConversationScreen>
             ],
           ),
         ),
-        AnimatedSwitcher(
-          duration: const Duration(milliseconds: 220),
-          switchInCurve: Curves.easeOutCubic,
-          switchOutCurve: Curves.easeInCubic,
-          child: _recording
-              ? _buildRecordingBar(context)
-              : _buildComposer(context),
+        Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            _buildReplyStrip(context),
+            if (_partnerTyping && !_recording) _buildTypingIndicator(context),
+            AnimatedSwitcher(
+              duration: const Duration(milliseconds: 220),
+              switchInCurve: Curves.easeOutCubic,
+              switchOutCurve: Curves.easeInCubic,
+              child: _recording
+                  ? _buildRecordingBar(context)
+                  : _buildComposer(context),
+            ),
+          ],
         ),
       ],
     );
@@ -1825,6 +2251,109 @@ class _ConversationScreenState extends State<ConversationScreen>
 
   bool _sameDay(DateTime a, DateTime b) =>
       a.year == b.year && a.month == b.month && a.day == b.day;
+
+  Widget _buildReplyStrip(BuildContext context) {
+    final target = _replyTarget;
+    if (target == null) return const SizedBox.shrink();
+    final scheme = Theme.of(context).colorScheme;
+    final name = target.isMine ? 'You' : target.senderUsername;
+    final preview = target.isDeleted
+        ? 'Deleted message'
+        : target.kind == MessageKind.text
+        ? (target.body ?? '')
+        : target.displayName;
+    return Container(
+      decoration: BoxDecoration(
+        color: scheme.surface,
+        border: Border(
+          top: BorderSide(color: scheme.onSurface.withValues(alpha: .06)),
+        ),
+      ),
+      padding: const EdgeInsets.fromLTRB(14, 8, 8, 6),
+      child: Row(
+        children: [
+          Container(
+            width: 3,
+            height: 34,
+            decoration: BoxDecoration(
+              color: kAccent,
+              borderRadius: BorderRadius.circular(2),
+            ),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Replying to $name',
+                  style: const TextStyle(
+                    fontSize: 11.5,
+                    fontWeight: FontWeight.w700,
+                    color: kAccent,
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  preview,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: scheme.onSurface.withValues(alpha: .55),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          IconButton(
+            tooltip: 'Cancel reply',
+            onPressed: _cancelReply,
+            icon: Icon(
+              Icons.close_rounded,
+              size: 18,
+              color: scheme.onSurface.withValues(alpha: .55),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildTypingIndicator(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Container(
+      decoration: BoxDecoration(
+        color: scheme.surface,
+        border: Border(
+          top: BorderSide(color: scheme.onSurface.withValues(alpha: .06)),
+        ),
+      ),
+      padding: const EdgeInsets.fromLTRB(18, 6, 18, 2),
+      child: Row(
+        children: [
+          const SizedBox(
+            width: 10,
+            height: 10,
+            child: CircularProgressIndicator(
+              strokeWidth: 1.6,
+              color: kAccent,
+            ),
+          ),
+          const SizedBox(width: 8),
+          Text(
+            '$_partnerName is typing…',
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              fontSize: 11,
+              color: scheme.onSurface.withValues(alpha: .5),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 
   Widget _buildComposer(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
@@ -1871,6 +2400,7 @@ class _ConversationScreenState extends State<ConversationScreen>
                 child: TextField(
                   controller: _composer,
                   focusNode: _composerFocus,
+                  onChanged: _onComposerChanged,
                   enabled: canType,
                   minLines: 1,
                   maxLines: 5,
@@ -2104,6 +2634,32 @@ class _RoundAction extends StatelessWidget {
             child: Center(child: child),
           ),
         ),
+      ),
+    );
+  }
+}
+
+class _EmojiChoice extends StatelessWidget {
+  const _EmojiChoice({required this.emoji, required this.onTap});
+
+  final String emoji;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(16),
+      child: Container(
+        width: 52,
+        height: 52,
+        decoration: BoxDecoration(
+          color: scheme.onSurface.withValues(alpha: .045),
+          borderRadius: BorderRadius.circular(16),
+        ),
+        alignment: Alignment.center,
+        child: Text(emoji, style: const TextStyle(fontSize: 26)),
       ),
     );
   }

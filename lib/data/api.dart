@@ -171,15 +171,22 @@ class Api {
     required String clientId,
     required String body,
     required Profile me,
+    String? replyToId,
   }) =>
       _guard(() async {
+        final params = <String, dynamic>{
+          'p_conversation_id': conversationId,
+          'p_client_id': clientId,
+          'p_body': body,
+        };
+        // Omit the key when there is no quote: older servers do not know the
+        // parameter, and passing an empty id is never a valid reply target.
+        if (replyToId != null && replyToId.isNotEmpty) {
+          params['p_reply_to_id'] = replyToId;
+        }
         final res = await _c.rpc(
           'send_text_message',
-          params: {
-            'p_conversation_id': conversationId,
-            'p_client_id': clientId,
-            'p_body': body,
-          },
+          params: params,
         ).timeout(_writeTimeout);
         final map = _firstMap(res);
         if (map == null) throw ApiException('The message could not be sent.');
@@ -199,6 +206,7 @@ class Api {
     required Uint8List bytes,
     int? durationMs,
     required Profile me,
+    String? replyToId,
   }) =>
       _guard(() async {
         if (bytes.length > Env.maxAttachmentBytes) {
@@ -206,17 +214,21 @@ class Api {
             'Files must be ${Env.maxAttachmentBytes ~/ (1024 * 1024)} MB or smaller.',
           );
         }
+        final params = <String, dynamic>{
+          'p_conversation_id': conversationId,
+          'p_client_id': clientId,
+          'p_kind': kind.dbValue,
+          'p_file_name': fileName,
+          'p_mime': mimeType,
+          'p_duration_ms': durationMs,
+          'p_data_base64': base64Encode(bytes),
+        };
+        if (replyToId != null && replyToId.isNotEmpty) {
+          params['p_reply_to_id'] = replyToId;
+        }
         final res = await _c.rpc(
           'send_attachment_message',
-          params: {
-            'p_conversation_id': conversationId,
-            'p_client_id': clientId,
-            'p_kind': kind.dbValue,
-            'p_file_name': fileName,
-            'p_mime': mimeType,
-            'p_duration_ms': durationMs,
-            'p_data_base64': base64Encode(bytes),
-          },
+          params: params,
         ).timeout(_attachmentTimeout);
         final map = _firstMap(res);
         if (map == null) {
@@ -259,6 +271,68 @@ class Api {
           mimeType: row['mime_type'] as String? ?? 'application/octet-stream',
           bytes: bytes,
         );
+      });
+
+  /// Edits one of my messages. Only the body is sent; the returned server row
+  /// carries `edited_at`, which the UI can merge into the local bubble.
+  /// [me] may be supplied to avoid a second profile lookup.
+  Future<ChatMessage> editMessage(
+    String messageId,
+    String body, {
+    Profile? me,
+  }) =>
+      _guard(() async {
+        final profile = me ?? await getMyProfile();
+        final res = await _c.rpc(
+          'edit_message',
+          params: {'p_message_id': messageId, 'p_body': body},
+        ).timeout(_writeTimeout);
+        final map = _firstMap(res);
+        if (map == null) throw ApiException('The message could not be edited.');
+        return _messageFromRecord(map, me: profile);
+      });
+
+  /// Server keeps a tombstone; callers should replace the bubble in place.
+  Future<void> deleteMessage(String messageId) => _guard(() async {
+        await _c.rpc(
+          'delete_message',
+          params: {'p_message_id': messageId},
+        ).timeout(_writeTimeout);
+      });
+
+  Future<void> addReaction(String messageId, String emoji) => _guard(() async {
+        await _c.rpc(
+          'add_reaction',
+          params: {'p_message_id': messageId, 'p_emoji': emoji},
+        ).timeout(_writeTimeout);
+      });
+
+  Future<void> removeReaction(String messageId, String emoji) =>
+      _guard(() async {
+        await _c.rpc(
+          'remove_reaction',
+          params: {'p_message_id': messageId, 'p_emoji': emoji},
+        ).timeout(_writeTimeout);
+      });
+
+  /// Updates this device's presence row and returns the server's timestamp.
+  Future<DateTime> touchPresence() => _guard(() async {
+        final res = await _c.rpc('touch_presence').timeout(_writeTimeout);
+        final parsed = _parseDate(res) ?? serverClock.now();
+        serverClock.observe(parsed);
+        return parsed;
+      });
+
+  /// Last-known presence of the other participant, or null if not available.
+  Future<PartnerPresence?> getPartnerPresence(String conversationId) =>
+      _guard(() async {
+        final res = await _c.rpc(
+          'get_partner_presence',
+          params: {'p_conversation_id': conversationId},
+        ).timeout(_readTimeout);
+        final map = _firstMap(res);
+        if (map == null || map['user_id'] == null) return null;
+        return PartnerPresence.fromJson(map);
       });
 
   static Future<void> testConnection(String url, String anonKey) async {
@@ -340,20 +414,22 @@ class Api {
     }
   }
 
+  /// Parses a raw `messages` row returned by a send/edit RPC. These rows do
+  /// not contain the joins or reactions that `get_messages` adds, so reactions
+  /// stay empty and are filled by the next fetch/realtime refresh.
   ChatMessage _messageFromRecord(
     Map<String, dynamic> map, {
-    required Profile me,
-    required String conversationId,
+    Profile? me,
+    String? conversationId,
   }) {
-    final createdAt =
-        DateTime.tryParse(map['created_at']?.toString() ?? '')?.toLocal() ??
-            DateTime.now();
+    final createdAt = _parseDate(map['created_at']) ?? DateTime.now();
     return ChatMessage(
       id: map['id'] as String,
-      conversationId: (map['conversation_id'] as String?) ?? conversationId,
-      senderId: map['sender_id'] as String? ?? me.id,
-      senderUsername: me.username,
-      senderAccent: me.accent,
+      conversationId:
+          (map['conversation_id'] as String?) ?? conversationId ?? '',
+      senderId: (map['sender_id'] as String?) ?? me?.id ?? '',
+      senderUsername: me?.username ?? (map['sender_username'] as String?) ?? '',
+      senderAccent: me?.accent ?? (map['sender_accent'] as num?)?.toInt() ?? 0,
       kind: MessageKind.fromDb(map['kind'] as String? ?? 'text'),
       body: map['body'] as String?,
       attachmentName: map['attachment_name'] as String?,
@@ -363,7 +439,23 @@ class Api {
       clientId: map['client_id'] as String? ?? '',
       createdAt: createdAt,
       isMine: true,
+      replyToId: map['reply_to_id'] as String?,
+      replyToBody: map['reply_to_body'] as String?,
+      replyToKind: map['reply_to_kind'] as String?,
+      replyToSenderId: map['reply_to_sender_id'] as String?,
+      replyToSenderUsername: map['reply_to_sender_username'] as String?,
+      editedAt: _parseDate(map['edited_at']),
+      deletedAt: _parseDate(map['deleted_at']),
+      deliveredAt: _parseDate(map['delivered_at']),
     );
+  }
+
+  static DateTime? _parseDate(dynamic value) {
+    if (value == null) return null;
+    if (value is DateTime) return value.toLocal();
+    if (value is Map && value.isNotEmpty) return _parseDate(value.values.first);
+    if (value is List && value.isNotEmpty) return _parseDate(value.first);
+    return DateTime.tryParse(value.toString())?.toLocal();
   }
 
   @visibleForTesting
@@ -476,6 +568,48 @@ class Api {
         'Messages are limited to 4,000 characters.',
         raw: raw,
         code: e.code,
+      );
+    }
+    if (lower.contains('message_not_found')) {
+      return ApiException(
+        'That message is no longer available.',
+        raw: raw,
+        code: 'message_not_found',
+      );
+    }
+    if (lower.contains('cannot_edit')) {
+      return ApiException(
+        'This message can no longer be edited.',
+        raw: raw,
+        code: 'cannot_edit',
+      );
+    }
+    if (lower.contains('cannot_delete')) {
+      return ApiException(
+        'This message can no longer be deleted.',
+        raw: raw,
+        code: 'cannot_delete',
+      );
+    }
+    if (lower.contains('invalid_reaction')) {
+      return ApiException(
+        'That reaction is not supported.',
+        raw: raw,
+        code: 'invalid_reaction',
+      );
+    }
+    if (lower.contains('already_reacted')) {
+      return ApiException(
+        'You already added that reaction.',
+        raw: raw,
+        code: 'already_reacted',
+      );
+    }
+    if (lower.contains('reaction_not_found')) {
+      return ApiException(
+        'That reaction was already removed.',
+        raw: raw,
+        code: 'reaction_not_found',
       );
     }
     if (lower.contains('conversation_full') ||

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
@@ -6,6 +7,8 @@ import '../core/format.dart';
 import '../core/theme.dart';
 import '../data/models.dart';
 import 'ui.dart';
+
+enum _MessageAction { reply, forward, react, edit, delete }
 
 const _waveHeights = <double>[
   .28, .52, .38, .74, .46, .9, .58, .34, .68, .48, .82, .4,
@@ -26,6 +29,13 @@ class MessageBubble extends StatelessWidget {
     this.onPlayVoice,
     this.onOpenImage,
     this.onSaveAttachment,
+    this.onReply,
+    this.onForward,
+    this.onEdit,
+    this.onDelete,
+    this.onReact,
+    this.onReactionTap,
+    this.myUserId,
   });
 
   final ChatMessage message;
@@ -40,6 +50,107 @@ class MessageBubble extends StatelessWidget {
   final VoidCallback? onOpenImage;
   final VoidCallback? onSaveAttachment;
 
+  // Message actions. All are optional so older call sites keep compiling.
+  final VoidCallback? onReply;
+  final VoidCallback? onForward;
+  final VoidCallback? onEdit;
+  final VoidCallback? onDelete;
+  final VoidCallback? onReact;
+  final ValueChanged<String>? onReactionTap;
+  final String? myUserId;
+
+  bool get _deleted => message.isDeleted;
+
+  bool get _hasActions =>
+      onReply != null ||
+      onForward != null ||
+      onEdit != null ||
+      onDelete != null ||
+      onReact != null;
+
+  List<MessageReaction> get _reactions => message.reactions;
+
+  void _showActions(BuildContext context) {
+    final actions = <_MessageAction>[
+      if (onReply != null) _MessageAction.reply,
+      if (onForward != null && !_deleted) _MessageAction.forward,
+      if (onReact != null && !_deleted) _MessageAction.react,
+      if (onEdit != null &&
+          message.isMine &&
+          !_deleted &&
+          message.kind == MessageKind.text)
+        _MessageAction.edit,
+      if (onDelete != null && message.isMine && !_deleted)
+        _MessageAction.delete,
+    ];
+    if (actions.isEmpty) return;
+
+    unawaited(
+      showAppSheet<_MessageAction>(
+        context,
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(20, 4, 20, 18),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              for (final action in actions)
+                _MessageActionTile(
+                  icon: _actionIcon(action),
+                  label: _actionLabel(action),
+                  danger: action == _MessageAction.delete,
+                  onTap: () => Navigator.of(context).pop(action),
+                ),
+            ],
+          ),
+        ),
+      ).then((action) {
+        if (action == null) return;
+        switch (action) {
+          case _MessageAction.reply:
+            onReply?.call();
+          case _MessageAction.forward:
+            onForward?.call();
+          case _MessageAction.react:
+            onReact?.call();
+          case _MessageAction.edit:
+            onEdit?.call();
+          case _MessageAction.delete:
+            onDelete?.call();
+        }
+      }),
+    );
+  }
+
+  IconData _actionIcon(_MessageAction action) {
+    switch (action) {
+      case _MessageAction.reply:
+        return Icons.reply_rounded;
+      case _MessageAction.forward:
+        return Icons.forward_rounded;
+      case _MessageAction.react:
+        return Icons.add_reaction_outlined;
+      case _MessageAction.edit:
+        return Icons.edit_outlined;
+      case _MessageAction.delete:
+        return Icons.delete_outline_rounded;
+    }
+  }
+
+  String _actionLabel(_MessageAction action) {
+    switch (action) {
+      case _MessageAction.reply:
+        return 'Reply';
+      case _MessageAction.forward:
+        return 'Forward';
+      case _MessageAction.react:
+        return 'React';
+      case _MessageAction.edit:
+        return 'Edit message';
+      case _MessageAction.delete:
+        return 'Delete message';
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
@@ -49,6 +160,8 @@ class MessageBubble extends StatelessWidget {
     final muted = mine
         ? Colors.white.withValues(alpha: .62)
         : scheme.onSurface.withValues(alpha: .42);
+    final replyQuote = _replyQuote(foreground, muted);
+    final reactionChips = _reactionChips(foreground, muted);
 
     final bubble = Container(
       constraints: BoxConstraints(
@@ -91,7 +204,9 @@ class MessageBubble extends StatelessWidget {
             : CrossAxisAlignment.start,
         mainAxisSize: MainAxisSize.min,
         children: [
+          if (replyQuote != null) replyQuote,
           _content(context, foreground, muted),
+          if (reactionChips != null) reactionChips,
           SizedBox(height: message.isImage && message.localBytes != null ? 5 : 3),
           Padding(
             padding: EdgeInsets.symmetric(
@@ -133,6 +248,7 @@ class MessageBubble extends StatelessWidget {
           Flexible(
             child: GestureDetector(
               onTap: failed ? onRetry : null,
+              onLongPress: () => _showActions(context),
               child: AnimatedOpacity(
                 opacity: message.status == MessageStatus.sending ? .92 : 1,
                 duration: const Duration(milliseconds: 180),
@@ -145,7 +261,113 @@ class MessageBubble extends StatelessWidget {
     );
   }
 
+  Widget? _replyQuote(Color foreground, Color muted) {
+    final replyId = message.replyToId;
+    if (replyId == null || replyId.isEmpty) return null;
+    final sender = message.replyToSenderUsername;
+    final body = message.replyToBody;
+    final label = sender == null || sender.isEmpty ? 'Original' : sender;
+    final preview =
+        body == null || body.trim().isEmpty ? 'Attachment' : body;
+    return Container(
+      margin: const EdgeInsets.only(bottom: 7),
+      padding: const EdgeInsets.fromLTRB(9, 6, 9, 6),
+      decoration: BoxDecoration(
+        color: foreground.withValues(alpha: .11),
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(
+            label,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              color: foreground,
+              fontSize: 11.5,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+          const SizedBox(height: 2),
+          Text(
+            preview,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(color: muted, fontSize: 11.5, height: 1.3),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget? _reactionChips(Color foreground, Color muted) {
+    final reactions = _reactions;
+    if (reactions.isEmpty) return null;
+    final grouped = <String, List<MessageReaction>>{};
+    for (final reaction in reactions) {
+      grouped.putIfAbsent(reaction.emoji, () => []).add(reaction);
+    }
+    return Padding(
+      padding: const EdgeInsets.only(top: 6),
+      child: Wrap(
+        spacing: 5,
+        runSpacing: 5,
+        children: [
+          for (final entry in grouped.entries)
+            _ReactionChip(
+              emoji: entry.key,
+              count: entry.value.length,
+              selected: entry.value.any(
+                (reaction) => reaction.userId == myUserId,
+              ),
+              foreground: foreground,
+              muted: muted,
+              onTap: onReactionTap == null
+                  ? null
+                  : () => onReactionTap!(entry.key),
+            ),
+          if (onReact != null && !_deleted)
+            InkWell(
+              onTap: onReact,
+              borderRadius: BorderRadius.circular(11),
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 4),
+                decoration: BoxDecoration(
+                  color: foreground.withValues(alpha: .10),
+                  borderRadius: BorderRadius.circular(11),
+                ),
+                child: Icon(
+                  Icons.add_reaction_outlined,
+                  size: 13,
+                  color: muted,
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
   Widget _content(BuildContext context, Color foreground, Color muted) {
+    if (_deleted) {
+      return Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(Icons.block_outlined, size: 14, color: muted),
+          const SizedBox(width: 6),
+          Text(
+            'This message was deleted',
+            style: TextStyle(
+              color: muted,
+              fontSize: 13,
+              fontStyle: FontStyle.italic,
+            ),
+          ),
+        ],
+      );
+    }
     switch (message.kind) {
       case MessageKind.text:
         return Text(
@@ -438,6 +660,7 @@ class MessageBubble extends StatelessWidget {
 
   Widget _statusRow(BuildContext context, Color muted, bool failed) {
     final sending = message.status == MessageStatus.sending;
+    final read = message.isRead;
     return Row(
       mainAxisSize: MainAxisSize.min,
       children: [
@@ -450,17 +673,17 @@ class MessageBubble extends StatelessWidget {
             fontFeatures: const [FontFeature.tabularFigures()],
           ),
         ),
+        if (message.editedAt != null) ...[
+          const SizedBox(width: 4),
+          Text(
+            'edited',
+            style: TextStyle(color: muted, fontSize: 9.5),
+          ),
+        ],
         if (message.isMine) ...[
           const SizedBox(width: 4),
           if (sending)
-            SizedBox(
-              width: 10,
-              height: 10,
-              child: CircularProgressIndicator(
-                strokeWidth: 1.4,
-                color: muted,
-              ),
-            )
+            Icon(Icons.schedule_rounded, size: 12, color: muted)
           else if (failed)
             const Row(
               mainAxisSize: MainAxisSize.min,
@@ -481,14 +704,30 @@ class MessageBubble extends StatelessWidget {
                 ),
               ],
             )
-          else if (showReadReceipt)
+          else if (showReadReceipt && !_deleted)
+            // sent/delivered = one check, read = two checks.
             Icon(
-              message.isRead ? Icons.done_all_rounded : Icons.done_rounded,
+              read ? Icons.done_all_rounded : Icons.done_rounded,
               size: 13,
-              color: message.isRead
+              color: read
                   ? const Color(0xFFB7F2DB)
                   : Colors.white.withValues(alpha: .7),
             ),
+        ],
+        if (_hasActions) ...[
+          const SizedBox(width: 4),
+          InkWell(
+            onTap: () => _showActions(context),
+            borderRadius: BorderRadius.circular(8),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 1, vertical: 1),
+              child: Icon(
+                Icons.more_horiz_rounded,
+                size: 14,
+                color: muted.withValues(alpha: .85),
+              ),
+            ),
+          ),
         ],
       ],
     );
@@ -504,5 +743,87 @@ class MessageBubble extends StatelessWidget {
       return Icons.folder_zip_outlined;
     }
     return Icons.insert_drive_file_outlined;
+  }
+}
+
+class _MessageActionTile extends StatelessWidget {
+  const _MessageActionTile({
+    required this.icon,
+    required this.label,
+    required this.onTap,
+    this.danger = false,
+  });
+
+  final IconData icon;
+  final String label;
+  final VoidCallback onTap;
+  final bool danger;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final color = danger ? kDanger : scheme.onSurface;
+    return ListTile(
+      contentPadding: EdgeInsets.zero,
+      leading: Icon(icon, size: 20, color: color.withValues(alpha: .8)),
+      title: Text(
+        label,
+        style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: color),
+      ),
+      onTap: onTap,
+    );
+  }
+}
+
+class _ReactionChip extends StatelessWidget {
+  const _ReactionChip({
+    required this.emoji,
+    required this.count,
+    required this.selected,
+    required this.foreground,
+    required this.muted,
+    this.onTap,
+  });
+
+  final String emoji;
+  final int count;
+  final bool selected;
+  final Color foreground;
+  final Color muted;
+  final VoidCallback? onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(11),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 4),
+        decoration: BoxDecoration(
+          color: selected
+              ? foreground.withValues(alpha: .22)
+              : foreground.withValues(alpha: .10),
+          borderRadius: BorderRadius.circular(11),
+          border: selected
+              ? Border.all(color: foreground.withValues(alpha: .45))
+              : null,
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(emoji, style: const TextStyle(fontSize: 12)),
+            const SizedBox(width: 3),
+            Text(
+              '$count',
+              style: TextStyle(
+                color: selected ? foreground : muted,
+                fontSize: 10.5,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 }

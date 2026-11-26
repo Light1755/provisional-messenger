@@ -232,6 +232,11 @@ class _ChatsScreenState extends State<ChatsScreen> {
                                 key: ValueKey(conversation.id),
                                 conversation: conversation,
                                 myId: app.me?.id ?? '',
+                                online:
+                                    app
+                                        .presenceFor(conversation.partnerId)
+                                        ?.isOnline ??
+                                    false,
                                 onTap: () => _openConversation(conversation),
                               );
                             },
@@ -250,11 +255,13 @@ class _ConversationTile extends StatelessWidget {
     required this.conversation,
     required this.myId,
     required this.onTap,
+    this.online = false,
   });
 
   final ConversationSummary conversation;
   final String myId;
   final VoidCallback onTap;
+  final bool online;
 
   @override
   Widget build(BuildContext context) {
@@ -284,6 +291,12 @@ class _ConversationTile extends StatelessWidget {
                     accent: conversation.partnerAccent,
                     size: 52,
                   ),
+                  if (online)
+                    const Positioned(
+                      right: 0,
+                      bottom: 0,
+                      child: PresenceDot(online: true, size: 13),
+                    ),
                   if (unread)
                     Positioned(
                       right: -3,

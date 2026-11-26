@@ -3,7 +3,7 @@
 Provisional is a two-person messenger built around deletion. You create a username, start a chat, choose a timer, and either person can burn the chat at any time. There is no email, phone number, password, demo account, or seeded conversation.
 
 - Web app: https://light1755.github.io/provisional-messenger/
-- Android release: https://github.com/Light1755/provisional-messenger/releases/tag/v1.0.4
+- Android release: https://github.com/Light1755/provisional-messenger/releases/tag/v1.1.0
 
 The client is Flutter. The server is Supabase: Postgres, anonymous auth, Realtime, and a scheduled cleanup job. `supabase/setup.sql` installs the whole server side in one run.
 
@@ -75,7 +75,7 @@ from cron.job
 where jobname = 'provisional-purge-expired';
 ```
 
-6. Optional: run `select public.health_check();` in the SQL Editor. It should return `"ok": true`, `"cron_ok": true`, and `"schema_version": 4`. The keep-alive workflow checks all three.
+6. Optional: run `select public.health_check();` in the SQL Editor. It should return `"ok": true`, `"cron_ok": true`, and `"schema_version": 5`. The keep-alive workflow checks all three.
 
 ### 2. Run the client
 
@@ -115,7 +115,7 @@ Wait for the minute job, then refresh both clients.
 
 ## Build for sharing
 
-Current release: 1.0.4 (build 5). CI rejects empty or wrong `SUPABASE_URL` and key values before building.
+Current release: 1.1.0 (build 6). CI rejects empty or wrong `SUPABASE_URL` and key values before building.
 
 Web build for the live project page:
 
@@ -142,8 +142,8 @@ flutter build appbundle --release \
 Rename the outputs for release uploads:
 
 ```bash
-cp build/app/outputs/flutter-apk/app-release.apk provisional-messenger-v1.0.4.apk
-cp build/app/outputs/bundle/release/app-release.aab provisional-messenger-v1.0.4.aab
+cp build/app/outputs/flutter-apk/app-release.apk provisional-messenger-v1.1.0.apk
+cp build/app/outputs/bundle/release/app-release.aab provisional-messenger-v1.1.0.aab
 ```
 
 Release builds need the signing values from `android/key.properties` or the `KEY_*`/`KEYSTORE_*` environment variables in `docs/DEPLOYMENT.md`. Gradle fails with a clear error when they are missing; debug builds do not need them. The application id is `com.light1755.provisionalmessenger`; keep the same signing key for future updates.

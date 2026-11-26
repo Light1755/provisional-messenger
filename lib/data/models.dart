@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:typed_data';
 
 import '../core/server_clock.dart';
@@ -210,7 +211,57 @@ class ConversationDetail {
   );
 }
 
-enum MessageStatus { sending, sent, failed }
+/// One emoji reaction returned by `get_messages`.
+///
+/// The SQL array carries `{emoji, user_id, username, accent}`; `messageId` is
+/// filled in from the owning row when the array element omits it.
+class MessageReaction {
+  const MessageReaction({
+    this.messageId = '',
+    this.userId = '',
+    this.username = '',
+    this.accent = 0,
+    this.emoji = '',
+  });
+
+  final String messageId;
+  final String userId;
+  final String username;
+  final int accent;
+  final String emoji;
+
+  factory MessageReaction.fromJson(Map<String, dynamic> json) => MessageReaction(
+        messageId: json['message_id'] as String? ?? '',
+        userId: json['user_id'] as String? ?? '',
+        username: json['username'] as String? ?? '',
+        accent: (json['accent'] as num?)?.toInt() ?? 0,
+        emoji: json['emoji'] as String? ?? '',
+      );
+}
+
+/// Last-known presence for the other participant in a conversation.
+class PartnerPresence {
+  const PartnerPresence({
+    required this.userId,
+    required this.lastSeen,
+    required this.isOnline,
+  });
+
+  final String userId;
+  final DateTime? lastSeen;
+  final bool isOnline;
+
+  factory PartnerPresence.fromJson(Map<String, dynamic> json) => PartnerPresence(
+        userId: json['user_id'] as String? ?? '',
+        lastSeen: _tryDate(json['last_seen']),
+        isOnline: _asBool(json['is_online']),
+      );
+}
+
+// `delivered` is appended so existing enum indices stay stable. Parsed rows
+// keep defaulting to `sent`; the UI can opt into `delivered` when it renders
+// delivery receipts.
+enum MessageStatus { sending, sent, failed, delivered }
 
 class ChatMessage {
   ChatMessage({
@@ -231,6 +282,15 @@ class ChatMessage {
     this.isRead = false,
     this.status = MessageStatus.sent,
     this.localBytes,
+    this.replyToId,
+    this.replyToBody,
+    this.replyToKind,
+    this.replyToSenderId,
+    this.replyToSenderUsername,
+    this.editedAt,
+    this.deletedAt,
+    this.deliveredAt,
+    this.reactions = const <MessageReaction>[],
   });
 
   final String id;
@@ -251,6 +311,16 @@ class ChatMessage {
   bool isRead;
   MessageStatus status;
 
+  final String? replyToId;
+  final String? replyToBody;
+  final String? replyToKind;
+  final String? replyToSenderId;
+  final String? replyToSenderUsername;
+  final DateTime? editedAt;
+  final DateTime? deletedAt;
+  final DateTime? deliveredAt;
+  final List<MessageReaction> reactions;
+
   bool get isAttachment =>
       kind == MessageKind.file || kind == MessageKind.voice;
 
@@ -262,10 +332,35 @@ class ChatMessage {
     return attachmentName ?? 'File';
   }
 
+  /// True when the server returned a tombstone for a deleted message.
+  bool get isDeleted => deletedAt != null;
+
+  /// True when at least one reaction is attached to this message.
+  bool get hasReactions => reactions.isNotEmpty;
+
+  /// True when this message quotes an earlier message.
+  bool get isReply => replyToId != null;
+
+  /// A one-line quote for the replied-to message. Tombstones may have no body.
+  String get replyPreview {
+    if (replyToId == null) return '';
+    switch (MessageKind.fromDb(replyToKind ?? 'text')) {
+      case MessageKind.voice:
+        return 'Voice note';
+      case MessageKind.file:
+        return 'File';
+      case MessageKind.text:
+        final text = replyToBody?.replaceAll(RegExp(r'\s+'), ' ').trim() ?? '';
+        if (text.isEmpty) return 'Original message';
+        return text.length > 80 ? '${text.substring(0, 80)}…' : text;
+    }
+  }
+
   factory ChatMessage.fromJson(Map<String, dynamic> json) {
     final isMine = json['is_mine'] as bool? ?? false;
+    final messageId = json['message_id'] as String;
     return ChatMessage(
-      id: json['message_id'] as String,
+      id: messageId,
       conversationId: json['conversation_id'] as String,
       senderId: json['sender_id'] as String,
       senderUsername: json['sender_username'] as String? ?? '',
@@ -280,6 +375,15 @@ class ChatMessage {
       createdAt: _date(json['created_at']) ?? DateTime.now(),
       isMine: isMine,
       isRead: json['is_read'] as bool? ?? false,
+      replyToId: json['reply_to_id'] as String?,
+      replyToBody: json['reply_to_body'] as String?,
+      replyToKind: json['reply_to_kind'] as String?,
+      replyToSenderId: json['reply_to_sender_id'] as String?,
+      replyToSenderUsername: json['reply_to_sender_username'] as String?,
+      editedAt: _tryDate(json['edited_at']),
+      deletedAt: _tryDate(json['deleted_at']),
+      deliveredAt: _tryDate(json['delivered_at']),
+      reactions: _parseReactions(json['reactions'], messageId),
     );
   }
 
@@ -296,8 +400,9 @@ class ChatMessage {
   }) {
     final senderId = record['sender_id'] as String;
     final mine = senderId == myId;
+    final messageId = record['id'] as String;
     return ChatMessage(
-      id: record['id'] as String,
+      id: messageId,
       conversationId: record['conversation_id'] as String,
       senderId: senderId,
       senderUsername: mine ? myUsername : partnerUsername,
@@ -311,11 +416,34 @@ class ChatMessage {
       clientId: record['client_id'] as String,
       createdAt: _date(record['created_at']) ?? DateTime.now(),
       isMine: mine,
+      replyToId: record['reply_to_id'] as String?,
+      replyToBody: record['reply_to_body'] as String?,
+      replyToKind: record['reply_to_kind'] as String?,
+      replyToSenderId: record['reply_to_sender_id'] as String?,
+      replyToSenderUsername: record['reply_to_sender_username'] as String?,
+      editedAt: _tryDate(record['edited_at']),
+      deletedAt: _tryDate(record['deleted_at']),
+      deliveredAt: _tryDate(record['delivered_at']),
+      reactions: _parseReactions(record['reactions'], messageId),
     );
   }
 
   ChatMessage copyWith({
     String? id,
+    String? body,
+    String? attachmentName,
+    String? attachmentMime,
+    int? attachmentSize,
+    int? durationMs,
+    String? replyToId,
+    String? replyToBody,
+    String? replyToKind,
+    String? replyToSenderId,
+    String? replyToSenderUsername,
+    DateTime? editedAt,
+    DateTime? deletedAt,
+    DateTime? deliveredAt,
+    List<MessageReaction>? reactions,
     bool? isRead,
     MessageStatus? status,
     Uint8List? localBytes,
@@ -326,14 +454,23 @@ class ChatMessage {
     senderUsername: senderUsername,
     senderAccent: senderAccent,
     kind: kind,
-    body: body,
-    attachmentName: attachmentName,
-    attachmentMime: attachmentMime,
-    attachmentSize: attachmentSize,
-    durationMs: durationMs,
+    body: body ?? this.body,
+    attachmentName: attachmentName ?? this.attachmentName,
+    attachmentMime: attachmentMime ?? this.attachmentMime,
+    attachmentSize: attachmentSize ?? this.attachmentSize,
+    durationMs: durationMs ?? this.durationMs,
     clientId: clientId,
     createdAt: createdAt,
     isMine: isMine,
+    replyToId: replyToId ?? this.replyToId,
+    replyToBody: replyToBody ?? this.replyToBody,
+    replyToKind: replyToKind ?? this.replyToKind,
+    replyToSenderId: replyToSenderId ?? this.replyToSenderId,
+    replyToSenderUsername: replyToSenderUsername ?? this.replyToSenderUsername,
+    editedAt: editedAt ?? this.editedAt,
+    deletedAt: deletedAt ?? this.deletedAt,
+    deliveredAt: deliveredAt ?? this.deliveredAt,
+    reactions: reactions ?? this.reactions,
     isRead: isRead ?? this.isRead,
     status: status ?? this.status,
     localBytes: localBytes ?? this.localBytes,
@@ -370,4 +507,51 @@ DateTime? _date(dynamic value) {
   if (value == null) return null;
   if (value is DateTime) return value.toLocal();
   return DateTime.parse(value.toString()).toLocal();
+}
+
+/// Tolerant variant for newer columns: a bad timestamp must not make a whole
+/// message unreadable.
+DateTime? _tryDate(dynamic value) {
+  if (value == null) return null;
+  if (value is DateTime) return value.toLocal();
+  return DateTime.tryParse(value.toString())?.toLocal();
+}
+
+bool _asBool(dynamic value) {
+  if (value is bool) return value;
+  if (value is num) return value != 0;
+  final text = value?.toString().toLowerCase();
+  return text == 'true' || text == '1' || text == 't';
+}
+
+List<MessageReaction> _parseReactions(dynamic value, String messageId) {
+  if (value == null) return const <MessageReaction>[];
+  if (value is String) {
+    if (value.trim().isEmpty) return const <MessageReaction>[];
+    try {
+      return _reactionList(jsonDecode(value), messageId);
+    } on FormatException {
+      return const <MessageReaction>[];
+    }
+  }
+  return _reactionList(value, messageId);
+}
+
+List<MessageReaction> _reactionList(dynamic value, String messageId) {
+  if (value is List) {
+    return value
+        .whereType<Map>()
+        .map((e) => MessageReaction.fromJson(_withMessageId(e, messageId)))
+        .toList(growable: false);
+  }
+  if (value is Map) {
+    return [MessageReaction.fromJson(_withMessageId(value, messageId))];
+  }
+  return const <MessageReaction>[];
+}
+
+Map<String, dynamic> _withMessageId(Map raw, String messageId) {
+  final map = Map<String, dynamic>.from(raw);
+  map['message_id'] ??= messageId;
+  return map;
 }

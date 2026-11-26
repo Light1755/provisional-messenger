@@ -95,6 +95,36 @@ class Avatar extends StatelessWidget {
   }
 }
 
+/// Small online/offline indicator that sits on avatars and in chat headers.
+class PresenceDot extends StatelessWidget {
+  const PresenceDot({
+    super.key,
+    required this.online,
+    this.size = 11,
+    this.borderWidth = 2,
+  });
+
+  final bool online;
+  final double size;
+  final double borderWidth;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Container(
+      width: size,
+      height: size,
+      decoration: BoxDecoration(
+        color: online
+            ? const Color(0xFF31C48D)
+            : scheme.onSurface.withValues(alpha: .26),
+        shape: BoxShape.circle,
+        border: Border.all(color: scheme.surface, width: borderWidth),
+      ),
+    );
+  }
+}
+
 class SoftIcon extends StatelessWidget {
   const SoftIcon({
     super.key,
