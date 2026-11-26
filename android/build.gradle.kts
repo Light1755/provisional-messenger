@@ -3,6 +3,16 @@ allprojects {
         google()
         mavenCentral()
     }
+
+    // Android Gradle Plugin's release-only lint tasks crash on the Java 17
+    // runtime bundled with this Flutter toolchain (List.removeLast was added
+    // in Java 21). Dart analysis and CI cover app correctness; these tasks
+    // only lint bundled plugin sources and are not needed to ship the APK.
+    tasks.configureEach {
+        if (name.startsWith("lintVital")) {
+            enabled = false
+        }
+    }
 }
 
 val newBuildDir: Directory =

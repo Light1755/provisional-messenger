@@ -128,7 +128,7 @@ flutter build apk --release \
   --dart-define=SUPABASE_ANON_KEY=YOUR_ANON_OR_PUBLISHABLE_KEY
 ```
 
-The Android release build currently uses the debug signing key. That is fine for local testing, but create a real keystore before publishing an APK. The application id is still `com.example.provisional_messenger`, which should also change before a store release.
+Release builds are signed with the keystore described in `docs/DEPLOYMENT.md`. The application id is `com.light1755.provisionalmessenger`; keep the same signing key for future updates.
 
 [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) has the GitHub Pages setup, the APK signing steps, and the keep-alive details.
 

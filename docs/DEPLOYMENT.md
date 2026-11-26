@@ -67,7 +67,7 @@ flutter build apk --release \
   --dart-define=SUPABASE_ANON_KEY=YOUR_ANON_OR_PUBLISHABLE_KEY
 ```
 
-The file is at `build/app/outputs/flutter-apk/app-release.apk`. The current Gradle file signs release builds with the debug key, so this APK is for testing and direct sharing, not a store release.
+The file is at `build/app/outputs/flutter-apk/app-release.apk`. Release builds use the signing config from `android/key.properties` described below. The application id is `com.light1755.provisionalmessenger`; keep this id and the same signing key for all future updates.
 
 ### Create a release keystore
 
@@ -124,7 +124,7 @@ android {
 
 `android/key.properties`, `*.jks`, and `*.keystore` are already in `.gitignore`.
 
-Before a store release, change `applicationId` and `namespace` from `com.example.provisional_messenger` to an identifier you control. Changing the application id later creates a separate app, so do it before the first public release.
+The `applicationId` and `namespace` are already set to `com.light1755.provisionalmessenger`. Do not change them after release: a different id installs as a separate app.
 
 Build the store bundle with:
 
